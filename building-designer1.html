@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Building Designer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  // Force the classic JSX transform (plain React.createElement calls).
+  // Babel's default "automatic" transform emits `import` statements, which
+  // fail with "Cannot use import statement outside a module" in a plain
+  // <script> tag - that was the cause of the blank page.
+  window.__BABEL_RUNTIME__ = "classic";
+</script>
+<style>
+  html, body, #root { height: 100%; margin: 0; }
+  input[type=number]::-webkit-inner-spin-button { opacity: 1; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/plain" id="app-source">
+const { useState, useRef, useEffect, useCallback } = React;
+
+/* ---------- offline storage shim (mirrors the window.storage API, backed by localStorage) ---------- */
+window.storage = {
+  async get(key, shared) {
+    const raw = localStorage.getItem("bdesigner:" + key);
+    if (raw === null) throw new Error("not found");
+    return { key, value: raw, shared: !!shared };
+  },
+  async set(key, value, shared) {
+    localStorage.setItem("bdesigner:" + key, value);
+    return { key, value, shared: !!shared };
+  },
+  async delete(key, shared) {
+    localStorage.removeItem("bdesigner:" + key);
+    return { key, deleted: true, shared: !!shared };
+  },
+  async list(prefix, shared) {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k.startsWith("bdesigner:" + (prefix || ""))) keys.push(k.replace("bdesigner:", ""));
+    }
+    return { keys, prefix, shared: !!shared };
+  },
+};
+
+/* ---------- tiny dependency-free icon glyphs (stand-ins for lucide-react) ---------- */
+function glyphIcon(ch) {
+  return function Icon({ size = 14 }) {
+    return React.createElement("span", { style: { fontSize: size, lineHeight: 1, display: "inline-block" } }, ch);
+  };
+}
+const MousePointer2 = glyphIcon("↖");
+const Square = glyphIcon("▭");
+const CircleIcon = glyphIcon("○");
+const Minus = glyphIcon("─");
+const Ruler = glyphIcon("📏");
+const Type = glyphIcon("T");
+const Trash2 = glyphIcon("🗑");
+const Copy = glyphIcon("⧉");
+const Save = glyphIcon("💾");
+const FolderOpen = glyphIcon("📂");
+const ZoomIn = glyphIcon("+");
+const ZoomOut = glyphIcon("−");
+const Maximize2 = glyphIcon("⤢");
+const X = glyphIcon("×");
+const Plus = glyphIcon("+");
+
+/* ---------- constants & helpers ---------- */
+
+const PX_PER_CM_DEFAULT = 2.4;
+const MIN_SIZE = 10; // cm
+
+const COLORS = [
+  { name: "Outline",  fill: "none",     stroke: "#221d17" },
+  { name: "Room",     fill: "#EFE6D3",  stroke: "#4a3f2c" },
+  { name: "Terrace",  fill: "#DCE6D6",  stroke: "#3d5236" },
+  { name: "Water",    fill: "#CFE1EC",  stroke: "#2c5773" },
+  { name: "Structure",fill: "#D9D6CE",  stroke: "#4a4a44" },
+  { name: "Road",     fill: "#E4D8B8",  stroke: "#8a7040" },
+];
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+const snap = (v, size, on) => (on ? Math.round(v / size) * size : v);
+const dist = (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1);
+
+function fmt(cm, units) {
+  if (units === "m") {
+    const m = cm / 100;
+    return (Math.round(m * 100) / 100).toString().replace(/\.00?$/, "") + " m";
+  }
+  return Math.round(cm) + " cm";
+}
+
+function slugify(s) {
+  return s.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "untitled";
+}
+
+function defaultElement(type, x, y) {
+  const base = { id: uid(), type, label: "" };
+  if (type === "room") return { ...base, x, y, w: 300, h: 300, colorIdx: 1, label: "Room" };
+  if (type === "circle") return { ...base, x, y, w: 200, h: 200, colorIdx: 3, label: "" };
+  if (type === "wall") return { ...base, x1: x, y1: y, x2: x + 200, y2: y, thickness: 15 };
+  if (type === "dimension") return { ...base, x1: x, y1: y, x2: x + 200, y2: y, customLabel: "" };
+  if (type === "label") return { ...base, x, y, text: "Label" };
+  return base;
+}
+
+const HANDLES = [
+  { id: "nw", cx: 0, cy: 0, cursor: "nwse-resize" },
+  { id: "n",  cx: 0.5, cy: 0, cursor: "ns-resize" },
+  { id: "ne", cx: 1, cy: 0, cursor: "nesw-resize" },
+  { id: "e",  cx: 1, cy: 0.5, cursor: "ew-resize" },
+  { id: "se", cx: 1, cy: 1, cursor: "nwse-resize" },
+  { id: "s",  cx: 0.5, cy: 1, cursor: "ns-resize" },
+  { id: "sw", cx: 0, cy: 1, cursor: "nesw-resize" },
+  { id: "w",  cx: 0, cy: 0.5, cursor: "ew-resize" },
+];
+
+function resizeBox(box, handle, dx, dy) {
+  let { x, y, w, h } = box;
+  if (handle.includes("w")) { x += dx; w -= dx; }
+  if (handle.includes("e")) { w += dx; }
+  if (handle.includes("n")) { y += dy; h -= dy; }
+  if (handle.includes("s")) { h += dy; }
+  if (w < MIN_SIZE) { if (handle.includes("w")) x -= (MIN_SIZE - w); w = MIN_SIZE; }
+  if (h < MIN_SIZE) { if (handle.includes("n")) y -= (MIN_SIZE - h); h = MIN_SIZE; }
+  return { x, y, w, h };
+}
+
+/* ---------- main component ---------- */
+
+function BuildingDesigner() {
+  const [elements, setElements] = useState([]);
+  const [selectedId, setSelectedId] = useState(null);
+  const [tool, setTool] = useState("select");
+  const [units, setUnits] = useState("cm");
+  const [gridSize, setGridSize] = useState(50);
+  const [snapOn, setSnapOn] = useState(true);
+  const [pxPerCm, setPxPerCm] = useState(PX_PER_CM_DEFAULT);
+  const [pan, setPan] = useState({ x: 80, y: 60 });
+  const [draft, setDraft] = useState(null);
+  const [projectName, setProjectName] = useState("Untitled Plan");
+  const [openMenu, setOpenMenu] = useState(false);
+  const [savedList, setSavedList] = useState([]);
+  const [status, setStatus] = useState("");
+  const [cursorModel, setCursorModel] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+
+  const containerRef = useRef(null);
+  const interaction = useRef(null);
+
+  const selected = elements.find((e) => e.id === selectedId) || null;
+
+  const toModel = useCallback(
+    (clientX, clientY) => {
+      const rect = containerRef.current.getBoundingClientRect();
+      return {
+        x: (clientX - rect.left - pan.x) / pxPerCm,
+        y: (clientY - rect.top - pan.y) / pxPerCm,
+      };
+    },
+    [pan, pxPerCm]
+  );
+  const toScreen = useCallback((mx, my) => ({ x: mx * pxPerCm + pan.x, y: my * pxPerCm + pan.y }), [pan, pxPerCm]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get("autosave-plan", false);
+        if (res && res.value) {
+          const data = JSON.parse(res.value);
+          if (data.elements) setElements(data.elements);
+          if (data.gridSize) setGridSize(data.gridSize);
+          if (data.units) setUnits(data.units);
+          if (data.projectName) setProjectName(data.projectName);
+        }
+      } catch (e) { /* no autosave yet */ }
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(async () => {
+      try {
+        await window.storage.set(
+          "autosave-plan",
+          JSON.stringify({ elements, gridSize, units, projectName }),
+          false
+        );
+      } catch (e) { /* ignore */ }
+    }, 700);
+    return () => clearTimeout(t);
+  }, [elements, gridSize, units, projectName, loaded]);
+
+  useEffect(() => {
+    const onKey = (e) => {
+      const tag = document.activeElement && document.activeElement.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (e.key === "Escape") { setDraft(null); setSelectedId(null); setTool("select"); }
+      else if ((e.key === "Delete" || e.key === "Backspace") && selectedId) {
+        setElements((els) => els.filter((el) => el.id !== selectedId));
+        setSelectedId(null);
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "d" && selectedId) {
+        e.preventDefault();
+        duplicateSelected();
+      } else if (e.key === "v") setTool("select");
+      else if (e.key === "r") setTool("room");
+      else if (e.key === "c") setTool("circle");
+      else if (e.key === "w") setTool("wall");
+      else if (e.key === "d") setTool("dimension");
+      else if (e.key === "t") setTool("label");
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selectedId, elements]);
+
+  function duplicateSelected() {
+    if (!selected) return;
+    const copy = { ...selected, id: uid() };
+    const off = gridSize;
+    if ("x" in copy) { copy.x += off; copy.y += off; }
+    if ("x1" in copy) { copy.x1 += off; copy.y1 += off; copy.x2 += off; copy.y2 += off; }
+    setElements((els) => [...els, copy]);
+    setSelectedId(copy.id);
+  }
+
+  function updateElement(id, patch) {
+    setElements((els) => els.map((el) => (el.id === id ? { ...el, ...patch } : el)));
+  }
+
+  function startBackground(e) {
+    if (e.button !== 0) return;
+    const m = toModel(e.clientX, e.clientY);
+    if (tool === "select") {
+      setSelectedId(null);
+      interaction.current = { type: "pan", startClientX: e.clientX, startClientY: e.clientY, startPan: pan };
+    } else if (tool === "label") {
+      const el = defaultElement("label", snap(m.x, gridSize, snapOn), snap(m.y, gridSize, snapOn));
+      setElements((els) => [...els, el]);
+      setSelectedId(el.id);
+      setTool("select");
+    } else {
+      interaction.current = { type: "draw", startModel: m };
+      setDraft({ type: tool, x1: m.x, y1: m.y, x2: m.x, y2: m.y });
+    }
+  }
+
+  function startElement(e, el) {
+    e.stopPropagation();
+    if (tool !== "select") return;
+    setSelectedId(el.id);
+    const m = toModel(e.clientX, e.clientY);
+    interaction.current = { type: "move", startModel: m, orig: el };
+  }
+
+  function startHandle(e, el, handleId) {
+    e.stopPropagation();
+    setSelectedId(el.id);
+    const m = toModel(e.clientX, e.clientY);
+    interaction.current = { type: "resize", startModel: m, orig: el, handle: handleId };
+  }
+
+  function startEndpoint(e, el, which) {
+    e.stopPropagation();
+    setSelectedId(el.id);
+    const m = toModel(e.clientX, e.clientY);
+    interaction.current = { type: "endpoint", startModel: m, orig: el, which };
+  }
+
+  useEffect(() => {
+    function onMove(e) {
+      const m = toModel(e.clientX, e.clientY);
+      setCursorModel(m);
+      const it = interaction.current;
+      if (!it) return;
+
+      if (it.type === "pan") {
+        setPan({ x: it.startPan.x + (e.clientX - it.startClientX), y: it.startPan.y + (e.clientY - it.startClientY) });
+        return;
+      }
+      if (it.type === "draw") {
+        setDraft((d) => (d ? { ...d, x2: m.x, y2: m.y } : d));
+        return;
+      }
+      const rawDx = m.x - it.startModel.x;
+      const rawDy = m.y - it.startModel.y;
+      const dx = snap(rawDx, gridSize, snapOn);
+      const dy = snap(rawDy, gridSize, snapOn);
+
+      if (it.type === "move") {
+        const o = it.orig;
+        if ("x" in o) updateElement(o.id, { x: o.x + dx, y: o.y + dy });
+        else if ("x1" in o) updateElement(o.id, { x1: o.x1 + dx, y1: o.y1 + dy, x2: o.x2 + dx, y2: o.y2 + dy });
+      } else if (it.type === "resize") {
+        const box = resizeBox({ x: it.orig.x, y: it.orig.y, w: it.orig.w, h: it.orig.h }, it.handle, dx, dy);
+        updateElement(it.orig.id, box);
+      } else if (it.type === "endpoint") {
+        const o = it.orig;
+        if (it.which === 1) updateElement(o.id, { x1: o.x1 + dx, y1: o.y1 + dy });
+        else updateElement(o.id, { x2: o.x2 + dx, y2: o.y2 + dy });
+      }
+    }
+    function onUp() {
+      const it = interaction.current;
+      if (it && it.type === "draw" && draft) {
+        const x1 = snap(draft.x1, gridSize, snapOn), y1 = snap(draft.y1, gridSize, snapOn);
+        let x2 = snap(draft.x2, gridSize, snapOn), y2 = snap(draft.y2, gridSize, snapOn);
+        const hasDrag = dist(x1, y1, x2, y2) > MIN_SIZE;
+        let el = null;
+        if (draft.type === "room" || draft.type === "circle") {
+          if (hasDrag) {
+            el = defaultElement(draft.type, Math.min(x1, x2), Math.min(y1, y2));
+            el.w = Math.max(MIN_SIZE, Math.abs(x2 - x1));
+            el.h = Math.max(MIN_SIZE, Math.abs(y2 - y1));
+          } else {
+            el = defaultElement(draft.type, x1, y1);
+          }
+        } else if (draft.type === "wall" || draft.type === "dimension") {
+          if (hasDrag) {
+            el = defaultElement(draft.type, x1, y1);
+            el.x1 = x1; el.y1 = y1; el.x2 = x2; el.y2 = y2;
+          }
+        }
+        if (el) {
+          setElements((els) => [...els, el]);
+          setSelectedId(el.id);
+        }
+        setTool("select");
+      }
+      interaction.current = null;
+      setDraft(null);
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
+  }, [toModel, gridSize, snapOn, draft]);
+
+  function onWheel(e) {
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      const rect = containerRef.current.getBoundingClientRect();
+      const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
+      const modelBefore = { x: (cx - pan.x) / pxPerCm, y: (cy - pan.y) / pxPerCm };
+      const next = Math.min(8, Math.max(0.3, pxPerCm * (1 - e.deltaY * 0.0015)));
+      setPxPerCm(next);
+      setPan({ x: cx - modelBefore.x * next, y: cy - modelBefore.y * next });
+    } else {
+      setPan((p) => ({ x: p.x - e.deltaX, y: p.y - e.deltaY }));
+    }
+  }
+
+  function zoomBy(factor) {
+    const rect = containerRef.current.getBoundingClientRect();
+    const cx = rect.width / 2, cy = rect.height / 2;
+    const modelBefore = { x: (cx - pan.x) / pxPerCm, y: (cy - pan.y) / pxPerCm };
+    const next = Math.min(8, Math.max(0.3, pxPerCm * factor));
+    setPxPerCm(next);
+    setPan({ x: cx - modelBefore.x * next, y: cy - modelBefore.y * next });
+  }
+
+  function fitToContent() {
+    if (elements.length === 0) { setPxPerCm(PX_PER_CM_DEFAULT); setPan({ x: 80, y: 60 }); return; }
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    elements.forEach((el) => {
+      const xs = "x" in el ? [el.x, el.x + el.w] : [el.x1, el.x2];
+      const ys = "y" in el ? [el.y, el.y + el.h] : [el.y1, el.y2];
+      minX = Math.min(minX, ...xs); maxX = Math.max(maxX, ...xs);
+      minY = Math.min(minY, ...ys); maxY = Math.max(maxY, ...ys);
+    });
+    const rect = containerRef.current.getBoundingClientRect();
+    const pad = 60;
+    const scale = Math.min((rect.width - pad * 2) / Math.max(1, maxX - minX), (rect.height - pad * 2) / Math.max(1, maxY - minY));
+    const next = Math.min(8, Math.max(0.15, scale));
+    setPxPerCm(next);
+    setPan({ x: pad - minX * next, y: pad - minY * next });
+  }
+
+  async function saveProject() {
+    try {
+      const slug = slugify(projectName);
+      await window.storage.set(`plan-${slug}`, JSON.stringify({ name: projectName, elements, gridSize, units, updatedAt: Date.now() }), false);
+      let idx = [];
+      try {
+        const r = await window.storage.get("plan-index", false);
+        if (r && r.value) idx = JSON.parse(r.value);
+      } catch (e) { /* none yet */ }
+      idx = idx.filter((p) => p.slug !== slug);
+      idx.unshift({ slug, name: projectName, updatedAt: Date.now() });
+      await window.storage.set("plan-index", JSON.stringify(idx), false);
+      setStatus("Saved ✓");
+      setTimeout(() => setStatus(""), 1800);
+    } catch (e) {
+      setStatus("Couldn't save");
+      setTimeout(() => setStatus(""), 1800);
+    }
+  }
+
+  async function openMenuToggle() {
+    if (!openMenu) {
+      try {
+        const r = await window.storage.get("plan-index", false);
+        setSavedList(r && r.value ? JSON.parse(r.value) : []);
+      } catch (e) { setSavedList([]); }
+    }
+    setOpenMenu((v) => !v);
+  }
+
+  async function loadProject(slug) {
+    try {
+      const r = await window.storage.get(`plan-${slug}`, false);
+      if (r && r.value) {
+        const data = JSON.parse(r.value);
+        setElements(data.elements || []);
+        setGridSize(data.gridSize || 50);
+        setUnits(data.units || "cm");
+        setProjectName(data.name || "Untitled Plan");
+        setSelectedId(null);
+      }
+    } catch (e) { setStatus("Couldn't load"); setTimeout(() => setStatus(""), 1800); }
+    setOpenMenu(false);
+  }
+
+  function newProject() {
+    if (elements.length && !window.confirm("Start a new plan? Unsaved changes to the current canvas will be replaced (autosave keeps a copy).")) return;
+    setElements([]); setSelectedId(null); setProjectName("Untitled Plan");
+  }
+
+  const bbox = (() => {
+    if (elements.length === 0) return null;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    elements.forEach((el) => {
+      const xs = "x" in el ? [el.x, el.x + el.w] : [el.x1, el.x2];
+      const ys = "y" in el ? [el.y, el.y + el.h] : [el.y1, el.y2];
+      minX = Math.min(minX, ...xs); maxX = Math.max(maxX, ...xs);
+      minY = Math.min(minY, ...ys); maxY = Math.max(maxY, ...ys);
+    });
+    return { w: maxX - minX, h: maxY - minY };
+  })();
+
+  const TOOLS = [
+    { id: "select", icon: MousePointer2, label: "Select (V)" },
+    { id: "room", icon: Square, label: "Room (R)" },
+    { id: "circle", icon: CircleIcon, label: "Circle (C)" },
+    { id: "wall", icon: Minus, label: "Wall (W)" },
+    { id: "dimension", icon: Ruler, label: "Dimension (D)" },
+    { id: "label", icon: Type, label: "Text (T)" },
+  ];
+
+  const step = gridSize * pxPerCm;
+  const majorStep = step * 5;
+
+  return (
+    <div className="w-full h-full flex flex-col select-none" style={{ background: "#F6F2E7", fontFamily: "'IBM Plex Sans', ui-sans-serif, system-ui", minHeight: 600 }}>
+      <div className="flex items-center gap-3 px-3 py-2 border-b" style={{ background: "#20262E", borderColor: "#10141a" }}>
+        <span className="text-sm tracking-wide" style={{ color: "#E9E3D3", fontWeight: 600 }}>Plan Draft</span>
+        <input
+          value={projectName}
+          onChange={(e) => setProjectName(e.target.value)}
+          className="text-sm px-2 py-1 rounded-none outline-none"
+          style={{ background: "#2B323C", color: "#E9E3D3", border: "1px solid #3a4250", width: 180 }}
+        />
+        <button onClick={newProject} title="New plan" className="flex items-center gap-1 text-xs px-2 py-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}>
+          <Plus size={13} /> New
+        </button>
+        <button onClick={saveProject} title="Save" className="flex items-center gap-1 text-xs px-2 py-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}>
+          <Save size={13} /> Save
+        </button>
+        <div className="relative">
+          <button onClick={openMenuToggle} title="Open a saved plan" className="flex items-center gap-1 text-xs px-2 py-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}>
+            <FolderOpen size={13} /> Open
+          </button>
+          {openMenu && (
+            <div className="absolute left-0 top-8 z-20 w-56 max-h-64 overflow-auto" style={{ background: "#2B323C", border: "1px solid #3a4250" }}>
+              {savedList.length === 0 && <div className="text-xs px-3 py-2" style={{ color: "#9aa1ab" }}>No saved plans yet.</div>}
+              {savedList.map((p) => (
+                <button key={p.slug} onClick={() => loadProject(p.slug)} className="w-full text-left text-xs px-3 py-2 hover:opacity-80" style={{ color: "#E9E3D3", borderBottom: "1px solid #3a4250" }}>
+                  {p.name}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        {status && <span className="text-xs" style={{ color: "#D98E2B" }}>{status}</span>}
+
+        <div className="flex-1" />
+
+        <label className="text-xs flex items-center gap-1" style={{ color: "#C9CBCF" }}>
+          <input type="checkbox" checked={snapOn} onChange={(e) => setSnapOn(e.target.checked)} /> Snap
+        </label>
+        <select value={gridSize} onChange={(e) => setGridSize(Number(e.target.value))} className="text-xs px-1 py-1" style={{ background: "#2B323C", color: "#E9E3D3", border: "1px solid #3a4250" }}>
+          {[10, 25, 50, 100].map((g) => <option key={g} value={g}>{g} cm grid</option>)}
+        </select>
+        <div className="flex items-center" style={{ border: "1px solid #3a4250" }}>
+          <button onClick={() => setUnits("cm")} className="text-xs px-2 py-1" style={{ background: units === "cm" ? "#D98E2B" : "transparent", color: units === "cm" ? "#20262E" : "#C9CBCF" }}>cm</button>
+          <button onClick={() => setUnits("m")} className="text-xs px-2 py-1" style={{ background: units === "m" ? "#D98E2B" : "transparent", color: units === "m" ? "#20262E" : "#C9CBCF" }}>m</button>
+        </div>
+        <button onClick={() => zoomBy(0.8)} title="Zoom out" className="p-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}><ZoomOut size={14} /></button>
+        <button onClick={() => zoomBy(1.25)} title="Zoom in" className="p-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}><ZoomIn size={14} /></button>
+        <button onClick={fitToContent} title="Fit to content" className="p-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}><Maximize2 size={14} /></button>
+      </div>
+
+      <div className="flex flex-1 min-h-0">
+        <div className="flex flex-col gap-1 p-2" style={{ background: "#EDE7D8", borderRight: "1px solid #d9d0b8" }}>
+          {TOOLS.map((t) => {
+            const Icon = t.icon;
+            const active = tool === t.id;
+            return (
+              <button key={t.id} title={t.label} onClick={() => setTool(t.id)}
+                className="p-2 flex items-center justify-center"
+                style={{ background: active ? "#20262E" : "transparent", color: active ? "#D98E2B" : "#3a3226", border: "1px solid " + (active ? "#20262E" : "#d9d0b8") }}>
+                <Icon size={17} />
+              </button>
+            );
+          })}
+        </div>
+
+        <div
+          ref={containerRef}
+          onMouseDown={startBackground}
+          onWheel={onWheel}
+          className="relative flex-1 overflow-hidden"
+          style={{
+            cursor: tool === "select" ? "default" : "crosshair",
+            backgroundColor: "#FBF8F0",
+            backgroundImage: `
+              linear-gradient(#E4DCC3 1px, transparent 1px),
+              linear-gradient(90deg, #E4DCC3 1px, transparent 1px),
+              linear-gradient(#CFC49F 1px, transparent 1px),
+              linear-gradient(90deg, #CFC49F 1px, transparent 1px)`,
+            backgroundSize: `${step}px ${step}px, ${step}px ${step}px, ${majorStep}px ${majorStep}px, ${majorStep}px ${majorStep}px`,
+            backgroundPosition: `${pan.x}px ${pan.y}px, ${pan.x}px ${pan.y}px, ${pan.x}px ${pan.y}px, ${pan.x}px ${pan.y}px`,
+          }}
+        >
+          {elements.length === 0 && !draft && (
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+              <div className="text-sm text-center" style={{ color: "#9c927a", maxWidth: 260 }}>
+                Pick a tool on the left, then drag on the grid to draw. Everything snaps to {gridSize}cm — edit exact numbers on the right once selected.
+              </div>
+            </div>
+          )}
+
+          <svg className="absolute inset-0 w-full h-full" style={{ pointerEvents: "none" }}>
+            <defs>
+              <marker id="tick1" markerWidth="10" markerHeight="10" refX="5" refY="5" orient="auto">
+                <line x1="5" y1="0" x2="5" y2="10" stroke="#2c5773" strokeWidth="1.4" />
+              </marker>
+            </defs>
+            <g>
+              {elements.map((el) => renderShape(el, el.id === selectedId, toScreen, startElement, startHandle, startEndpoint, pxPerCm))}
+              {draft && renderDraft(draft, toScreen)}
+            </g>
+          </svg>
+
+          {elements.map((el) => renderOverlay(el, units, toScreen))}
+          {draft && draft.type === "dimension" && (
+            <OverlayText screen={mid(toScreen(draft.x1, draft.y1), toScreen(draft.x2, draft.y2))} text={fmt(dist(draft.x1, draft.y1, draft.x2, draft.y2), units)} accent />
+          )}
+
+          {cursorModel && (
+            <div className="absolute bottom-2 left-2 text-xs px-2 py-1" style={{ background: "#20262Ecc", color: "#E9E3D3", fontFamily: "'IBM Plex Mono', ui-monospace, monospace" }}>
+              x {Math.round(cursorModel.x)} · y {Math.round(cursorModel.y)}
+              {bbox && <span style={{ marginLeft: 12, color: "#9aa1ab" }}>overall {Math.round(bbox.w)} × {Math.round(bbox.h)} cm</span>}
+            </div>
+          )}
+        </div>
+
+        <div className="w-64 shrink-0 flex flex-col" style={{ background: "#EDE7D8", borderLeft: "1px solid #d9d0b8" }}>
+          <div className="p-3 overflow-auto" style={{ flex: "0 0 auto" }}>
+            {!selected && <div className="text-xs" style={{ color: "#8b8267" }}>Nothing selected. Click a shape to edit its exact measurements.</div>}
+            {selected && <PropertyEditor el={selected} onChange={(patch) => updateElement(selected.id, patch)} onDuplicate={duplicateSelected} onDelete={() => { setElements((els) => els.filter((e) => e.id !== selected.id)); setSelectedId(null); }} />}
+          </div>
+          <div className="border-t px-3 py-2 text-xs" style={{ borderColor: "#d9d0b8", color: "#6b6350", fontWeight: 600 }}>Layers ({elements.length})</div>
+          <div className="flex-1 overflow-auto px-2 pb-2">
+            {elements.map((el) => (
+              <div key={el.id} onClick={() => setSelectedId(el.id)}
+                className="flex items-center justify-between px-2 py-1 mb-1 text-xs cursor-pointer"
+                style={{ background: el.id === selectedId ? "#D98E2B33" : "transparent", border: "1px solid " + (el.id === selectedId ? "#D98E2B" : "transparent"), color: "#3a3226" }}>
+                <span className="truncate">{el.label || el.text || el.type}</span>
+                <button onClick={(e) => { e.stopPropagation(); setElements((els) => els.filter((x) => x.id !== el.id)); if (selectedId === el.id) setSelectedId(null); }} className="ml-1 opacity-60 hover:opacity-100"><X size={12} /></button>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function mid(a, b) { return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; }
+
+function OverlayText({ screen, text, accent, sub }) {
+  return (
+    <div className="absolute pointer-events-none text-center" style={{ left: screen.x, top: screen.y, transform: "translate(-50%,-50%)" }}>
+      <div className="text-xs px-1" style={{ background: "#FBF8F0dd", color: accent ? "#8a5a10" : "#33301f", fontFamily: "'IBM Plex Mono', ui-monospace, monospace", whiteSpace: "nowrap" }}>{text}</div>
+      {sub && <div className="text-[10px]" style={{ color: "#8a8163" }}>{sub}</div>}
+    </div>
+  );
+}
+
+function renderDraft(draft, toScreen) {
+  if (draft.type === "room" || draft.type === "circle") {
+    const a = toScreen(Math.min(draft.x1, draft.x2), Math.min(draft.y1, draft.y2));
+    const b = toScreen(Math.max(draft.x1, draft.x2), Math.max(draft.y1, draft.y2));
+    const w = b.x - a.x, h = b.y - a.y;
+    return draft.type === "room"
+      ? <rect x={a.x} y={a.y} width={w} height={h} fill="#D98E2B22" stroke="#D98E2B" strokeDasharray="4 3" />
+      : <ellipse cx={a.x + w / 2} cy={a.y + h / 2} rx={w / 2} ry={h / 2} fill="#D98E2B22" stroke="#D98E2B" strokeDasharray="4 3" />;
+  }
+  const p1 = toScreen(draft.x1, draft.y1), p2 = toScreen(draft.x2, draft.y2);
+  return <line x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y} stroke="#D98E2B" strokeWidth={2} strokeDasharray="4 3" />;
+}
+
+function renderShape(el, isSelected, toScreen, onDown, onHandle, onEndpoint, pxPerCm) {
+  const stroke = isSelected ? "#D98E2B" : undefined;
+  if (el.type === "room" || el.type === "circle") {
+    const c = COLORS[el.colorIdx] || COLORS[1];
+    const a = toScreen(el.x, el.y);
+    const w = el.w * pxPerCm, h = el.h * pxPerCm;
+    const commonProps = {
+      fill: c.fill, stroke: stroke || c.stroke, strokeWidth: isSelected ? 2.5 : 1.5,
+      vectorEffect: "non-scaling-stroke", style: { pointerEvents: "auto", cursor: "move" },
+      onMouseDown: (e) => onDown(e, el),
+    };
+    return (
+      <g key={el.id}>
+        {el.type === "room"
+          ? <rect x={a.x} y={a.y} width={w} height={h} {...commonProps} />
+          : <ellipse cx={a.x + w / 2} cy={a.y + h / 2} rx={w / 2} ry={h / 2} {...commonProps} />}
+        {isSelected && HANDLES.map((h2) => {
+          const hx = a.x + h2.cx * w, hy = a.y + h2.cy * h;
+          return (
+            <rect key={h2.id} x={hx - 4} y={hy - 4} width={8} height={8} fill="#FBF8F0" stroke="#20262E" strokeWidth={1}
+              style={{ cursor: h2.cursor, pointerEvents: "auto" }} onMouseDown={(e) => onHandle(e, el, h2.id)} />
+          );
+        })}
+      </g>
+    );
+  }
+  if (el.type === "wall") {
+    const p1 = toScreen(el.x1, el.y1), p2 = toScreen(el.x2, el.y2);
+    return (
+      <g key={el.id}>
+        <line x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y} stroke={stroke || "#2b2620"} strokeWidth={Math.max(2, el.thickness * pxPerCm)} strokeLinecap="square"
+          style={{ pointerEvents: "auto", cursor: "move" }} onMouseDown={(e) => onDown(e, el)} />
+        {isSelected && [{ p: p1, n: 1 }, { p: p2, n: 2 }].map(({ p, n }) => (
+          <circle key={n} cx={p.x} cy={p.y} r={5} fill="#FBF8F0" stroke="#20262E" strokeWidth={1.5}
+            style={{ cursor: "pointer", pointerEvents: "auto" }} onMouseDown={(e) => onEndpoint(e, el, n)} />
+        ))}
+      </g>
+    );
+  }
+  if (el.type === "dimension") {
+    const p1 = toScreen(el.x1, el.y1), p2 = toScreen(el.x2, el.y2);
+    const ang = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+    const nx = Math.sin(ang) * 6, ny = -Math.cos(ang) * 6;
+    return (
+      <g key={el.id}>
+        <line x1={p1.x - nx} y1={p1.y - ny} x2={p1.x + nx} y2={p1.y + ny} stroke={stroke || "#2c5773"} strokeWidth={1.4} vectorEffect="non-scaling-stroke" />
+        <line x1={p2.x - nx} y1={p2.y - ny} x2={p2.x + nx} y2={p2.y + ny} stroke={stroke || "#2c5773"} strokeWidth={1.4} vectorEffect="non-scaling-stroke" />
+        <line x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y} stroke={stroke || "#2c5773"} strokeWidth={1.4} vectorEffect="non-scaling-stroke"
+          style={{ pointerEvents: "auto", cursor: "move" }} onMouseDown={(e) => onDown(e, el)} />
+        {isSelected && [{ p: p1, n: 1 }, { p: p2, n: 2 }].map(({ p, n }) => (
+          <circle key={n} cx={p.x} cy={p.y} r={5} fill="#FBF8F0" stroke="#20262E" strokeWidth={1.5}
+            style={{ cursor: "pointer", pointerEvents: "auto" }} onMouseDown={(e) => onEndpoint(e, el, n)} />
+        ))}
+      </g>
+    );
+  }
+  return null;
+}
+
+function renderOverlay(el, units, toScreen) {
+  if (el.type === "room" || el.type === "circle") {
+    const c1 = toScreen(el.x, el.y), c2 = toScreen(el.x + el.w, el.y + el.h);
+    const center = mid(c1, c2);
+    return <OverlayText key={el.id} screen={center} text={el.label || (el.type === "room" ? "Room" : "")} sub={`${fmt(el.w, units)} × ${fmt(el.h, units)}`} />;
+  }
+  if (el.type === "wall") {
+    const p1 = toScreen(el.x1, el.y1), p2 = toScreen(el.x2, el.y2);
+    return <OverlayText key={el.id} screen={mid(p1, p2)} text={fmt(dist(el.x1, el.y1, el.x2, el.y2), units)} />;
+  }
+  if (el.type === "dimension") {
+    const p1 = toScreen(el.x1, el.y1), p2 = toScreen(el.x2, el.y2);
+    return <OverlayText key={el.id} screen={mid(p1, p2)} text={el.customLabel || fmt(dist(el.x1, el.y1, el.x2, el.y2), units)} accent />;
+  }
+  if (el.type === "label") {
+    const p = toScreen(el.x, el.y);
+    return <OverlayText key={el.id} screen={p} text={el.text} />;
+  }
+  return null;
+}
+
+function NumField({ label, value, onChange }) {
+  return (
+    <label className="flex items-center justify-between text-xs mb-1.5" style={{ color: "#4a4330" }}>
+      <span style={{ width: 46 }}>{label}</span>
+      <input type="number" value={Math.round(value)} onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
+        className="text-xs px-1.5 py-1 text-right" style={{ width: 90, background: "#FBF8F0", border: "1px solid #d9d0b8", fontFamily: "'IBM Plex Mono', ui-monospace, monospace" }} />
+    </label>
+  );
+}
+
+function PropertyEditor({ el, onChange, onDuplicate, onDelete }) {
+  const isBox = el.type === "room" || el.type === "circle";
+  const isLine = el.type === "wall" || el.type === "dimension";
+  return (
+    <div>
+      <div className="text-xs mb-2 uppercase tracking-wide" style={{ color: "#8b8267", letterSpacing: 1 }}>{el.type}</div>
+
+      {isBox && (
+        <>
+          <label className="block text-xs mb-2" style={{ color: "#4a4330" }}>
+            Name
+            <input value={el.label} onChange={(e) => onChange({ label: e.target.value })} className="w-full mt-1 text-xs px-1.5 py-1" style={{ background: "#FBF8F0", border: "1px solid #d9d0b8" }} />
+          </label>
+          <NumField label="X" value={el.x} onChange={(v) => onChange({ x: v })} />
+          <NumField label="Y" value={el.y} onChange={(v) => onChange({ y: v })} />
+          <NumField label="Width" value={el.w} onChange={(v) => onChange({ w: Math.max(10, v) })} />
+          <NumField label="Height" value={el.h} onChange={(v) => onChange({ h: Math.max(10, v) })} />
+          <div className="flex gap-1 mt-2 mb-1 flex-wrap">
+            {COLORS.map((c, i) => (
+              <button key={c.name} title={c.name} onClick={() => onChange({ colorIdx: i })}
+                style={{ width: 20, height: 20, background: c.fill === "none" ? "#fff" : c.fill, border: "2px solid " + (el.colorIdx === i ? "#D98E2B" : c.stroke) }} />
+            ))}
+          </div>
+        </>
+      )}
+
+      {isLine && (
+        <>
+          <NumField label="X1" value={el.x1} onChange={(v) => onChange({ x1: v })} />
+          <NumField label="Y1" value={el.y1} onChange={(v) => onChange({ y1: v })} />
+          <NumField label="X2" value={el.x2} onChange={(v) => onChange({ x2: v })} />
+          <NumField label="Y2" value={el.y2} onChange={(v) => onChange({ y2: v })} />
+          {el.type === "wall" && <NumField label="Thick." value={el.thickness} onChange={(v) => onChange({ thickness: Math.max(2, v) })} />}
+          {el.type === "dimension" && (
+            <label className="block text-xs mt-1" style={{ color: "#4a4330" }}>
+              Custom label
+              <input value={el.customLabel} placeholder="auto" onChange={(e) => onChange({ customLabel: e.target.value })} className="w-full mt-1 text-xs px-1.5 py-1" style={{ background: "#FBF8F0", border: "1px solid #d9d0b8" }} />
+            </label>
+          )}
+          <div className="text-xs mt-2" style={{ color: "#8b8267", fontFamily: "'IBM Plex Mono', ui-monospace, monospace" }}>
+            length {Math.round(dist(el.x1, el.y1, el.x2, el.y2))} cm
+          </div>
+        </>
+      )}
+
+      {el.type === "label" && (
+        <>
+          <label className="block text-xs mb-2" style={{ color: "#4a4330" }}>
+            Text
+            <input value={el.text} onChange={(e) => onChange({ text: e.target.value })} className="w-full mt-1 text-xs px-1.5 py-1" style={{ background: "#FBF8F0", border: "1px solid #d9d0b8" }} />
+          </label>
+          <NumField label="X" value={el.x} onChange={(v) => onChange({ x: v })} />
+          <NumField label="Y" value={el.y} onChange={(v) => onChange({ y: v })} />
+        </>
+      )}
+
+      <div className="flex gap-2 mt-3">
+        <button onClick={onDuplicate} className="flex-1 flex items-center justify-center gap-1 text-xs py-1.5" style={{ border: "1px solid #d9d0b8", color: "#3a3226" }}><Copy size={12} /> Duplicate</button>
+        <button onClick={onDelete} className="flex-1 flex items-center justify-center gap-1 text-xs py-1.5" style={{ border: "1px solid #b8564a", color: "#b8564a" }}><Trash2 size={12} /> Delete</button>
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<BuildingDesigner />);
+</script>
+<script>
+  (function () {
+    var source = document.getElementById("app-source").textContent;
+    var transformed = Babel.transform(source, {
+      presets: [["react", { runtime: "classic" }]],
+    }).code;
+    var script = document.createElement("script");
+    script.text = transformed;
+    document.body.appendChild(script);
+  })();
+</script>
+</body>
+</html>
