@@ -1,78 +1,8 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<title>Building Designer</title>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-<script src="https://cdn.tailwindcss.com"></script>
-<script>
-  // Force the classic JSX transform (plain React.createElement calls).
-  // Babel's default "automatic" transform emits `import` statements, which
-  // fail with "Cannot use import statement outside a module" in a plain
-  // <script> tag - that was the cause of the blank page.
-  window.__BABEL_RUNTIME__ = "classic";
-</script>
-<style>
-  html, body, #root { height: 100%; margin: 0; }
-  input[type=number]::-webkit-inner-spin-button { opacity: 1; }
-</style>
-</head>
-<body>
-<div id="root"></div>
-
-<script type="text/plain" id="app-source">
-const { useState, useRef, useEffect, useCallback } = React;
-
-/* ---------- offline storage shim (mirrors the window.storage API, backed by localStorage) ---------- */
-window.storage = {
-  async get(key, shared) {
-    const raw = localStorage.getItem("bdesigner:" + key);
-    if (raw === null) throw new Error("not found");
-    return { key, value: raw, shared: !!shared };
-  },
-  async set(key, value, shared) {
-    localStorage.setItem("bdesigner:" + key, value);
-    return { key, value, shared: !!shared };
-  },
-  async delete(key, shared) {
-    localStorage.removeItem("bdesigner:" + key);
-    return { key, deleted: true, shared: !!shared };
-  },
-  async list(prefix, shared) {
-    const keys = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (k.startsWith("bdesigner:" + (prefix || ""))) keys.push(k.replace("bdesigner:", ""));
-    }
-    return { keys, prefix, shared: !!shared };
-  },
-};
-
-/* ---------- tiny dependency-free icon glyphs (stand-ins for lucide-react) ---------- */
-function glyphIcon(ch) {
-  return function Icon({ size = 14 }) {
-    return React.createElement("span", { style: { fontSize: size, lineHeight: 1, display: "inline-block" } }, ch);
-  };
-}
-const MousePointer2 = glyphIcon("↖");
-const Square = glyphIcon("▭");
-const CircleIcon = glyphIcon("○");
-const Minus = glyphIcon("─");
-const CurveIcon = glyphIcon("⌒");
-const Ruler = glyphIcon("📏");
-const Type = glyphIcon("T");
-const Trash2 = glyphIcon("🗑");
-const Copy = glyphIcon("⧉");
-const Save = glyphIcon("💾");
-const FolderOpen = glyphIcon("📂");
-const ZoomIn = glyphIcon("+");
-const ZoomOut = glyphIcon("−");
-const Maximize2 = glyphIcon("⤢");
-const X = glyphIcon("×");
-const Plus = glyphIcon("+");
+import React, { useState, useRef, useEffect, useCallback } from "react";
+import {
+  MousePointer2, Square, Circle as CircleIcon, Minus, Spline, Ruler, Type,
+  Trash2, Copy, Save, FolderOpen, ZoomIn, ZoomOut, Maximize2, X, Plus,
+} from "lucide-react";
 
 /* ---------- constants & helpers ---------- */
 
@@ -139,7 +69,7 @@ function resizeBox(box, handle, dx, dy) {
 
 /* ---------- main component ---------- */
 
-function BuildingDesigner() {
+export default function BuildingDesigner() {
   const [elements, setElements] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [tool, setTool] = useState("select");
@@ -161,6 +91,7 @@ function BuildingDesigner() {
 
   const selected = elements.find((e) => e.id === selectedId) || null;
 
+  /* ----- coordinate transforms ----- */
   const toModel = useCallback(
     (clientX, clientY) => {
       const rect = containerRef.current.getBoundingClientRect();
@@ -173,6 +104,7 @@ function BuildingDesigner() {
   );
   const toScreen = useCallback((mx, my) => ({ x: mx * pxPerCm + pan.x, y: my * pxPerCm + pan.y }), [pan, pxPerCm]);
 
+  /* ----- load autosave on mount ----- */
   useEffect(() => {
     (async () => {
       try {
@@ -189,6 +121,7 @@ function BuildingDesigner() {
     })();
   }, []);
 
+  /* ----- autosave (debounced) ----- */
   useEffect(() => {
     if (!loaded) return;
     const t = setTimeout(async () => {
@@ -203,6 +136,7 @@ function BuildingDesigner() {
     return () => clearTimeout(t);
   }, [elements, gridSize, units, projectName, loaded]);
 
+  /* ----- keyboard shortcuts ----- */
   useEffect(() => {
     const onKey = (e) => {
       const tag = document.activeElement && document.activeElement.tagName;
@@ -239,6 +173,7 @@ function BuildingDesigner() {
     setSelectedId(copy.id);
   }
 
+  /* ----- pointer interaction ----- */
   function updateElement(id, patch) {
     setElements((els) => els.map((el) => (el.id === id ? { ...el, ...patch } : el)));
   }
@@ -396,6 +331,7 @@ function BuildingDesigner() {
     setPan({ x: pad - minX * next, y: pad - minY * next });
   }
 
+  /* ----- save / load ----- */
   async function saveProject() {
     try {
       const slug = slugify(projectName);
@@ -408,7 +344,7 @@ function BuildingDesigner() {
       idx = idx.filter((p) => p.slug !== slug);
       idx.unshift({ slug, name: projectName, updatedAt: Date.now() });
       await window.storage.set("plan-index", JSON.stringify(idx), false);
-      setStatus("Saved ✓");
+      setStatus("Saved \u2713");
       setTimeout(() => setStatus(""), 1800);
     } catch (e) {
       setStatus("Couldn't save");
@@ -446,6 +382,7 @@ function BuildingDesigner() {
     setElements([]); setSelectedId(null); setProjectName("Untitled Plan");
   }
 
+  /* ----- rendering helpers ----- */
   const bbox = (() => {
     if (elements.length === 0) return null;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -463,7 +400,7 @@ function BuildingDesigner() {
     { id: "room", icon: Square, label: "Room (R)" },
     { id: "circle", icon: CircleIcon, label: "Circle (C)" },
     { id: "wall", icon: Minus, label: "Wall (W)" },
-    { id: "curve", icon: CurveIcon, label: "Curve (U)" },
+    { id: "curve", icon: Spline, label: "Curve (U)" },
     { id: "dimension", icon: Ruler, label: "Dimension (D)" },
     { id: "label", icon: Type, label: "Text (T)" },
   ];
@@ -473,6 +410,7 @@ function BuildingDesigner() {
 
   return (
     <div className="w-full h-full flex flex-col select-none" style={{ background: "#F6F2E7", fontFamily: "'IBM Plex Sans', ui-sans-serif, system-ui", minHeight: 600 }}>
+      {/* top bar */}
       <div className="flex items-center gap-3 px-3 py-2 border-b" style={{ background: "#20262E", borderColor: "#10141a" }}>
         <span className="text-sm tracking-wide" style={{ color: "#E9E3D3", fontWeight: 600 }}>Plan Draft</span>
         <input
@@ -521,7 +459,9 @@ function BuildingDesigner() {
         <button onClick={fitToContent} title="Fit to content" className="p-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}><Maximize2 size={14} /></button>
       </div>
 
+      {/* toolbar + canvas + panel */}
       <div className="flex flex-1 min-h-0">
+        {/* tool rail */}
         <div className="flex flex-col gap-1 p-2" style={{ background: "#EDE7D8", borderRight: "1px solid #d9d0b8" }}>
           {TOOLS.map((t) => {
             const Icon = t.icon;
@@ -536,6 +476,7 @@ function BuildingDesigner() {
           })}
         </div>
 
+        {/* canvas */}
         <div
           ref={containerRef}
           onMouseDown={startBackground}
@@ -573,6 +514,7 @@ function BuildingDesigner() {
             </g>
           </svg>
 
+          {/* overlay labels */}
           {elements.map((el) => renderOverlay(el, units, toScreen))}
           {draft && draft.type === "dimension" && (
             <OverlayText screen={mid(toScreen(draft.x1, draft.y1), toScreen(draft.x2, draft.y2))} text={fmt(dist(draft.x1, draft.y1, draft.x2, draft.y2), units)} accent />
@@ -586,6 +528,7 @@ function BuildingDesigner() {
           )}
         </div>
 
+        {/* property panel */}
         <div className="w-64 shrink-0 flex flex-col" style={{ background: "#EDE7D8", borderLeft: "1px solid #d9d0b8" }}>
           <div className="p-3 overflow-auto" style={{ flex: "0 0 auto" }}>
             {!selected && <div className="text-xs" style={{ color: "#8b8267" }}>Nothing selected. Click a shape to edit its exact measurements.</div>}
@@ -607,6 +550,8 @@ function BuildingDesigner() {
     </div>
   );
 }
+
+/* ---------- sub components / render helpers ---------- */
 
 function mid(a, b) { return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; }
 
@@ -826,20 +771,3 @@ function PropertyEditor({ el, onChange, onDuplicate, onDelete }) {
     </div>
   );
 }
-
-const root = ReactDOM.createRoot(document.getElementById("root"));
-root.render(<BuildingDesigner />);
-</script>
-<script>
-  (function () {
-    var source = document.getElementById("app-source").textContent;
-    var transformed = Babel.transform(source, {
-      presets: [["react", { runtime: "classic" }]],
-    }).code;
-    var script = document.createElement("script");
-    script.text = transformed;
-    document.body.appendChild(script);
-  })();
-</script>
-</body>
-</html>
