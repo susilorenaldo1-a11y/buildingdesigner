@@ -7,14 +7,8 @@
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
 <script src="https://cdn.tailwindcss.com"></script>
-<script>
-  // Force the classic JSX transform (plain React.createElement calls).
-  // Babel's default "automatic" transform emits `import` statements, which
-  // fail with "Cannot use import statement outside a module" in a plain
-  // <script> tag - that was the cause of the blank page.
-  window.__BABEL_RUNTIME__ = "classic";
-</script>
 <style>
   html, body, #root { height: 100%; margin: 0; }
   input[type=number]::-webkit-inner-spin-button { opacity: 1; }
@@ -22,7 +16,6 @@
 </head>
 <body>
 <div id="root"></div>
-
 <script type="text/plain" id="app-source">
 const { useState, useRef, useEffect, useCallback } = React;
 
@@ -51,28 +44,38 @@ window.storage = {
   },
 };
 
+const getJsPDF = () => (window.jspdf && window.jspdf.jsPDF ? window.jspdf.jsPDF : null);
+
 /* ---------- tiny dependency-free icon glyphs (stand-ins for lucide-react) ---------- */
 function glyphIcon(ch) {
   return function Icon({ size = 14 }) {
     return React.createElement("span", { style: { fontSize: size, lineHeight: 1, display: "inline-block" } }, ch);
   };
 }
-const MousePointer2 = glyphIcon("↖");
-const Square = glyphIcon("▭");
-const CircleIcon = glyphIcon("○");
-const Minus = glyphIcon("─");
-const CurveIcon = glyphIcon("⌒");
-const Ruler = glyphIcon("📏");
+const MousePointer2 = glyphIcon("\u2196");
+const Square = glyphIcon("\u25AD");
+const CircleIcon = glyphIcon("\u25CB");
+const Minus = glyphIcon("\u2500");
+const Spline = glyphIcon("\u2312");
+const Ruler = glyphIcon("\uD83D\uDCCF");
 const Type = glyphIcon("T");
-const Trash2 = glyphIcon("🗑");
-const Copy = glyphIcon("⧉");
-const Save = glyphIcon("💾");
-const FolderOpen = glyphIcon("📂");
+const Trash2 = glyphIcon("\uD83D\uDDD1");
+const Copy = glyphIcon("\u29C9");
+const Save = glyphIcon("\uD83D\uDCBE");
+const FolderOpen = glyphIcon("\uD83D\uDCC2");
 const ZoomIn = glyphIcon("+");
-const ZoomOut = glyphIcon("−");
-const Maximize2 = glyphIcon("⤢");
-const X = glyphIcon("×");
+const ZoomOut = glyphIcon("\u2212");
+const Maximize2 = glyphIcon("\u2922");
+const X = glyphIcon("\u00D7");
 const Plus = glyphIcon("+");
+const Undo2 = glyphIcon("\u21B6");
+const Redo2 = glyphIcon("\u21B7");
+const Eye = glyphIcon("\uD83D\uDC41");
+const EyeOff = glyphIcon("\uD83D\uDEAB");
+const Download = glyphIcon("\u2913");
+const ChevronLeft = glyphIcon("\u2039");
+const ChevronRight = glyphIcon("\u203A");
+
 
 /* ---------- constants & helpers ---------- */
 
@@ -104,12 +107,24 @@ function slugify(s) {
   return s.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "untitled";
 }
 
+function curveLength(el) {
+  let len = 0, prev = { x: el.x1, y: el.y1 };
+  for (let i = 1; i <= 10; i++) {
+    const t = i / 10;
+    const x = (1 - t) * (1 - t) * el.x1 + 2 * (1 - t) * t * el.cx + t * t * el.x2;
+    const y = (1 - t) * (1 - t) * el.y1 + 2 * (1 - t) * t * el.cy + t * t * el.y2;
+    len += dist(prev.x, prev.y, x, y);
+    prev = { x, y };
+  }
+  return len;
+}
+
 function defaultElement(type, x, y) {
   const base = { id: uid(), type, label: "" };
   if (type === "room") return { ...base, x, y, w: 300, h: 300, colorIdx: 1, label: "Room" };
   if (type === "circle") return { ...base, x, y, w: 200, h: 200, colorIdx: 3, label: "" };
-  if (type === "wall") return { ...base, x1: x, y1: y, x2: x + 200, y2: y, thickness: 15 };
-  if (type === "curve") return { ...base, x1: x, y1: y, x2: x + 200, y2: y, cx: x + 100, cy: y, thickness: 15 };
+  if (type === "wall") return { ...base, x1: x, y1: y, x2: x + 200, y2: y, thickness: 15, colorIdx: 0 };
+  if (type === "curve") return { ...base, x1: x, y1: y, x2: x + 200, y2: y, cx: x + 100, cy: y, thickness: 15, colorIdx: 0 };
   if (type === "dimension") return { ...base, x1: x, y1: y, x2: x + 200, y2: y, customLabel: "" };
   if (type === "label") return { ...base, x, y, text: "Label" };
   return base;
@@ -137,11 +152,134 @@ function resizeBox(box, handle, dx, dy) {
   return { x, y, w, h };
 }
 
+function elementBBox(el) {
+  if ("w" in el) return { minX: el.x, minY: el.y, maxX: el.x + el.w, maxY: el.y + el.h };
+  if ("x1" in el) {
+    const xs = "cx" in el ? [el.x1, el.x2, el.cx] : [el.x1, el.x2];
+    const ys = "cx" in el ? [el.y1, el.y2, el.cy] : [el.y1, el.y2];
+    return { minX: Math.min(...xs), minY: Math.min(...ys), maxX: Math.max(...xs), maxY: Math.max(...ys) };
+  }
+  return { minX: el.x, minY: el.y, maxX: el.x, maxY: el.y };
+}
+
+function unionBBox(els) {
+  if (els.length === 0) return null;
+  const first = elementBBox(els[0]);
+  let { minX, minY, maxX, maxY } = first;
+  for (let i = 1; i < els.length; i++) {
+    const b = elementBBox(els[i]);
+    minX = Math.min(minX, b.minX); minY = Math.min(minY, b.minY);
+    maxX = Math.max(maxX, b.maxX); maxY = Math.max(maxY, b.maxY);
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+function escapeXML(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/* ---------- export to SVG / PNG / JPG / PDF ---------- */
+
+function buildExportSVG(elements, units, showMeasurements) {
+  if (elements.length === 0) return null;
+  const b = unionBBox(elements);
+  const pad = 80, scale = 4;
+  const W = (b.maxX - b.minX + pad * 2) * scale;
+  const H = (b.maxY - b.minY + pad * 2) * scale;
+  const ox = -b.minX + pad, oy = -b.minY + pad;
+  const tx = (x) => (x + ox) * scale;
+  const ty = (y) => (y + oy) * scale;
+
+  let shapes = "", labels = "";
+
+  elements.forEach((el) => {
+    if (el.type === "room" || el.type === "circle") {
+      const c = COLORS[el.colorIdx] || COLORS[1];
+      const x = tx(el.x), y = ty(el.y), w = el.w * scale, h = el.h * scale;
+      if (el.type === "room") {
+        shapes += `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${c.fill}" stroke="${c.stroke}" stroke-width="2"/>`;
+      } else {
+        shapes += `<ellipse cx="${x + w / 2}" cy="${y + h / 2}" rx="${w / 2}" ry="${h / 2}" fill="${c.fill}" stroke="${c.stroke}" stroke-width="2"/>`;
+      }
+      const main = el.label || (el.type === "room" ? "Room" : "");
+      const sub = showMeasurements ? `${fmt(el.w, units)} x ${fmt(el.h, units)}` : "";
+      const cx = x + w / 2, cy = y + h / 2;
+      if (main) labels += `<text x="${cx}" y="${sub ? cy - 6 : cy}" font-size="13" font-family="IBM Plex Mono, monospace" fill="#33301f" text-anchor="middle">${escapeXML(main)}</text>`;
+      if (sub) labels += `<text x="${cx}" y="${main ? cy + 10 : cy}" font-size="11" font-family="IBM Plex Mono, monospace" fill="#8a8163" text-anchor="middle">${escapeXML(sub)}</text>`;
+    } else if (el.type === "wall" || el.type === "curve") {
+      const c = COLORS[el.colorIdx ?? 0] || COLORS[0];
+      const p1x = tx(el.x1), p1y = ty(el.y1), p2x = tx(el.x2), p2y = ty(el.y2);
+      let midx, midy;
+      if (el.type === "wall") {
+        shapes += `<line x1="${p1x}" y1="${p1y}" x2="${p2x}" y2="${p2y}" stroke="${c.stroke}" stroke-width="${Math.max(2, el.thickness * scale)}" stroke-linecap="square"/>`;
+        midx = (p1x + p2x) / 2; midy = (p1y + p2y) / 2;
+      } else {
+        const cpx = tx(el.cx), cpy = ty(el.cy);
+        shapes += `<path d="M ${p1x} ${p1y} Q ${cpx} ${cpy} ${p2x} ${p2y}" fill="none" stroke="${c.stroke}" stroke-width="${Math.max(2, el.thickness * scale)}" stroke-linecap="round"/>`;
+        midx = tx(0.25 * el.x1 + 0.5 * el.cx + 0.25 * el.x2);
+        midy = ty(0.25 * el.y1 + 0.5 * el.cy + 0.25 * el.y2);
+      }
+      const len = el.type === "wall" ? dist(el.x1, el.y1, el.x2, el.y2) : curveLength(el);
+      const main = el.label || "";
+      const sub = showMeasurements ? fmt(len, units) : "";
+      const text = main || sub;
+      if (text) labels += `<text x="${midx}" y="${midy - 6}" font-size="12" font-family="IBM Plex Mono, monospace" fill="#33301f" text-anchor="middle">${escapeXML(text)}</text>`;
+    } else if (el.type === "dimension") {
+      const p1x = tx(el.x1), p1y = ty(el.y1), p2x = tx(el.x2), p2y = ty(el.y2);
+      const ang = Math.atan2(p2y - p1y, p2x - p1x);
+      const nx = Math.sin(ang) * 8, ny = -Math.cos(ang) * 8;
+      shapes += `<line x1="${p1x - nx}" y1="${p1y - ny}" x2="${p1x + nx}" y2="${p1y + ny}" stroke="#2c5773" stroke-width="1.5"/>`;
+      shapes += `<line x1="${p2x - nx}" y1="${p2y - ny}" x2="${p2x + nx}" y2="${p2y + ny}" stroke="#2c5773" stroke-width="1.5"/>`;
+      shapes += `<line x1="${p1x}" y1="${p1y}" x2="${p2x}" y2="${p2y}" stroke="#2c5773" stroke-width="1.5"/>`;
+      const text = el.customLabel || (showMeasurements ? fmt(dist(el.x1, el.y1, el.x2, el.y2), units) : "");
+      if (text) labels += `<text x="${(p1x + p2x) / 2}" y="${(p1y + p2y) / 2 - 8}" font-size="12" font-family="IBM Plex Mono, monospace" fill="#8a5a10" text-anchor="middle">${escapeXML(text)}</text>`;
+    } else if (el.type === "label") {
+      labels += `<text x="${tx(el.x)}" y="${ty(el.y)}" font-size="13" font-family="IBM Plex Mono, monospace" fill="#33301f" text-anchor="middle">${escapeXML(el.text)}</text>`;
+    }
+  });
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><rect x="0" y="0" width="${W}" height="${H}" fill="#FBF8F0"/>${shapes}${labels}</svg>`;
+}
+
+function downloadBlobUrl(url, filename) {
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+}
+
+function downloadSVGString(svgString, filename) {
+  const blob = new Blob([svgString], { type: "image/svg+xml" });
+  const url = URL.createObjectURL(blob);
+  downloadBlobUrl(url, filename);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function svgToCanvas(svgString) {
+  return new Promise((resolve, reject) => {
+    const m = svgString.match(/width="([\d.]+)" height="([\d.]+)"/);
+    const w = m ? parseFloat(m[1]) : 1000, h = m ? parseFloat(m[2]) : 1000;
+    const img = new Image();
+    const blob = new Blob([svgString], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#FBF8F0"; ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(img, 0, 0, w, h);
+      URL.revokeObjectURL(url);
+      resolve(canvas);
+    };
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
 /* ---------- main component ---------- */
 
 function BuildingDesigner() {
   const [elements, setElements] = useState([]);
-  const [selectedId, setSelectedId] = useState(null);
+  const [selectedIds, setSelectedIds] = useState([]);
   const [tool, setTool] = useState("select");
   const [units, setUnits] = useState("cm");
   const [gridSize, setGridSize] = useState(50);
@@ -149,30 +287,70 @@ function BuildingDesigner() {
   const [pxPerCm, setPxPerCm] = useState(PX_PER_CM_DEFAULT);
   const [pan, setPan] = useState({ x: 80, y: 60 });
   const [draft, setDraft] = useState(null);
+  const [marquee, setMarquee] = useState(null);
   const [projectName, setProjectName] = useState("Untitled Plan");
   const [openMenu, setOpenMenu] = useState(false);
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const [savedList, setSavedList] = useState([]);
   const [status, setStatus] = useState("");
   const [cursorModel, setCursorModel] = useState(null);
   const [loaded, setLoaded] = useState(false);
+  const [leftOpen, setLeftOpen] = useState(true);
+  const [rightOpen, setRightOpen] = useState(true);
+  const [showMeasurements, setShowMeasurements] = useState(true);
+  const [historyLen, setHistoryLen] = useState(0);
+  const [futureLen, setFutureLen] = useState(0);
 
   const containerRef = useRef(null);
   const interaction = useRef(null);
+  const marqueeRef = useRef(null);
+  const elementsRef = useRef([]);
+  const historyRef = useRef([]);
+  const futureRef = useRef([]);
 
-  const selected = elements.find((e) => e.id === selectedId) || null;
+  useEffect(() => { elementsRef.current = elements; }, [elements]);
 
+  const selected = selectedIds.length === 1 ? elements.find((e) => e.id === selectedIds[0]) : null;
+  const selectedSet = new Set(selectedIds);
+
+  /* ----- history ----- */
+  function pushHistory() {
+    historyRef.current.push(JSON.parse(JSON.stringify(elementsRef.current)));
+    if (historyRef.current.length > 60) historyRef.current.shift();
+    futureRef.current = [];
+    setHistoryLen(historyRef.current.length);
+    setFutureLen(0);
+  }
+  function undo() {
+    if (historyRef.current.length === 0) return;
+    const prev = historyRef.current.pop();
+    futureRef.current.push(JSON.parse(JSON.stringify(elementsRef.current)));
+    setElements(prev);
+    setSelectedIds([]);
+    setHistoryLen(historyRef.current.length);
+    setFutureLen(futureRef.current.length);
+  }
+  function redo() {
+    if (futureRef.current.length === 0) return;
+    const next = futureRef.current.pop();
+    historyRef.current.push(JSON.parse(JSON.stringify(elementsRef.current)));
+    setElements(next);
+    setSelectedIds([]);
+    setHistoryLen(historyRef.current.length);
+    setFutureLen(futureRef.current.length);
+  }
+
+  /* ----- coordinate transforms ----- */
   const toModel = useCallback(
     (clientX, clientY) => {
       const rect = containerRef.current.getBoundingClientRect();
-      return {
-        x: (clientX - rect.left - pan.x) / pxPerCm,
-        y: (clientY - rect.top - pan.y) / pxPerCm,
-      };
+      return { x: (clientX - rect.left - pan.x) / pxPerCm, y: (clientY - rect.top - pan.y) / pxPerCm };
     },
     [pan, pxPerCm]
   );
   const toScreen = useCallback((mx, my) => ({ x: mx * pxPerCm + pan.x, y: my * pxPerCm + pan.y }), [pan, pxPerCm]);
 
+  /* ----- load autosave on mount ----- */
   useEffect(() => {
     (async () => {
       try {
@@ -189,29 +367,31 @@ function BuildingDesigner() {
     })();
   }, []);
 
+  /* ----- autosave (debounced) ----- */
   useEffect(() => {
     if (!loaded) return;
     const t = setTimeout(async () => {
       try {
-        await window.storage.set(
-          "autosave-plan",
-          JSON.stringify({ elements, gridSize, units, projectName }),
-          false
-        );
+        await window.storage.set("autosave-plan", JSON.stringify({ elements, gridSize, units, projectName }), false);
       } catch (e) { /* ignore */ }
     }, 700);
     return () => clearTimeout(t);
   }, [elements, gridSize, units, projectName, loaded]);
 
+  /* ----- keyboard shortcuts ----- */
   useEffect(() => {
     const onKey = (e) => {
       const tag = document.activeElement && document.activeElement.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
-      if (e.key === "Escape") { setDraft(null); setSelectedId(null); setTool("select"); }
-      else if ((e.key === "Delete" || e.key === "Backspace") && selectedId) {
-        setElements((els) => els.filter((el) => el.id !== selectedId));
-        setSelectedId(null);
-      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "d" && selectedId) {
+      const meta = e.metaKey || e.ctrlKey;
+      if (meta && e.key.toLowerCase() === "z" && !e.shiftKey) { e.preventDefault(); undo(); }
+      else if (meta && (e.key.toLowerCase() === "y" || (e.key.toLowerCase() === "z" && e.shiftKey))) { e.preventDefault(); redo(); }
+      else if (e.key === "Escape") { setDraft(null); setSelectedIds([]); setTool("select"); }
+      else if ((e.key === "Delete" || e.key === "Backspace") && selectedIds.length) {
+        pushHistory();
+        setElements((els) => els.filter((el) => !selectedIds.includes(el.id)));
+        setSelectedIds([]);
+      } else if (meta && e.key.toLowerCase() === "d" && selectedIds.length) {
         e.preventDefault();
         duplicateSelected();
       } else if (e.key === "v") setTool("select");
@@ -224,35 +404,48 @@ function BuildingDesigner() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selectedId, elements]);
+  }, [selectedIds, elements]);
 
   function duplicateSelected() {
-    if (!selected) return;
-    const copy = { ...selected, id: uid() };
+    if (selectedIds.length === 0) return;
+    pushHistory();
     const off = gridSize;
-    if ("x" in copy) { copy.x += off; copy.y += off; }
-    if ("x1" in copy) {
-      copy.x1 += off; copy.y1 += off; copy.x2 += off; copy.y2 += off;
-      if ("cx" in copy) { copy.cx += off; copy.cy += off; }
-    }
-    setElements((els) => [...els, copy]);
-    setSelectedId(copy.id);
+    const copies = elements.filter((e) => selectedIds.includes(e.id)).map((e) => {
+      const copy = { ...e, id: uid() };
+      if ("x" in copy) { copy.x += off; copy.y += off; }
+      if ("x1" in copy) {
+        copy.x1 += off; copy.y1 += off; copy.x2 += off; copy.y2 += off;
+        if ("cx" in copy) { copy.cx += off; copy.cy += off; }
+      }
+      return copy;
+    });
+    setElements((els) => [...els, ...copies]);
+    setSelectedIds(copies.map((c) => c.id));
   }
 
+  /* ----- pointer interaction ----- */
   function updateElement(id, patch) {
     setElements((els) => els.map((el) => (el.id === id ? { ...el, ...patch } : el)));
   }
 
   function startBackground(e) {
-    if (e.button !== 0) return;
+    if (e.button !== 0 && e.button !== 1) return;
     const m = toModel(e.clientX, e.clientY);
     if (tool === "select") {
-      setSelectedId(null);
-      interaction.current = { type: "pan", startClientX: e.clientX, startClientY: e.clientY, startPan: pan };
+      if (e.button === 1 || e.altKey) {
+        e.preventDefault();
+        interaction.current = { type: "pan", startClientX: e.clientX, startClientY: e.clientY, startPan: pan };
+        return;
+      }
+      if (!e.shiftKey) setSelectedIds([]);
+      interaction.current = { type: "marquee", startModel: m, shift: e.shiftKey };
+      marqueeRef.current = { x1: m.x, y1: m.y, x2: m.x, y2: m.y };
+      setMarquee(marqueeRef.current);
     } else if (tool === "label") {
       const el = defaultElement("label", snap(m.x, gridSize, snapOn), snap(m.y, gridSize, snapOn));
+      pushHistory();
       setElements((els) => [...els, el]);
-      setSelectedId(el.id);
+      setSelectedIds([el.id]);
       setTool("select");
     } else {
       interaction.current = { type: "draw", startModel: m };
@@ -263,23 +456,30 @@ function BuildingDesigner() {
   function startElement(e, el) {
     e.stopPropagation();
     if (tool !== "select") return;
-    setSelectedId(el.id);
+    if (e.shiftKey) {
+      setSelectedIds((ids) => (ids.includes(el.id) ? ids.filter((id) => id !== el.id) : [...ids, el.id]));
+      return;
+    }
+    let ids = selectedIds.includes(el.id) ? selectedIds : [el.id];
+    if (!selectedIds.includes(el.id)) setSelectedIds(ids);
     const m = toModel(e.clientX, e.clientY);
-    interaction.current = { type: "move", startModel: m, orig: el };
+    const origMap = {};
+    elements.forEach((x) => { if (ids.includes(x.id)) origMap[x.id] = x; });
+    interaction.current = { type: "move", startModel: m, ids, origMap, historyPushed: false };
   }
 
   function startHandle(e, el, handleId) {
     e.stopPropagation();
-    setSelectedId(el.id);
+    setSelectedIds([el.id]);
     const m = toModel(e.clientX, e.clientY);
-    interaction.current = { type: "resize", startModel: m, orig: el, handle: handleId };
+    interaction.current = { type: "resize", startModel: m, orig: el, handle: handleId, historyPushed: false };
   }
 
   function startEndpoint(e, el, which) {
     e.stopPropagation();
-    setSelectedId(el.id);
+    setSelectedIds([el.id]);
     const m = toModel(e.clientX, e.clientY);
-    interaction.current = { type: "endpoint", startModel: m, orig: el, which };
+    interaction.current = { type: "endpoint", startModel: m, orig: el, which, historyPushed: false };
   }
 
   useEffect(() => {
@@ -293,6 +493,12 @@ function BuildingDesigner() {
         setPan({ x: it.startPan.x + (e.clientX - it.startClientX), y: it.startPan.y + (e.clientY - it.startClientY) });
         return;
       }
+      if (it.type === "marquee") {
+        const rect = { x1: it.startModel.x, y1: it.startModel.y, x2: m.x, y2: m.y };
+        marqueeRef.current = rect;
+        setMarquee(rect);
+        return;
+      }
       if (it.type === "draw") {
         setDraft((d) => (d ? { ...d, x2: m.x, y2: m.y } : d));
         return;
@@ -303,17 +509,24 @@ function BuildingDesigner() {
       const dy = snap(rawDy, gridSize, snapOn);
 
       if (it.type === "move") {
-        const o = it.orig;
-        if ("x" in o) updateElement(o.id, { x: o.x + dx, y: o.y + dy });
-        else if ("x1" in o) {
-          const patch = { x1: o.x1 + dx, y1: o.y1 + dy, x2: o.x2 + dx, y2: o.y2 + dy };
-          if ("cx" in o) { patch.cx = o.cx + dx; patch.cy = o.cy + dy; }
-          updateElement(o.id, patch);
-        }
+        if (!it.historyPushed) { pushHistory(); it.historyPushed = true; }
+        setElements((els) => els.map((el) => {
+          if (!it.ids.includes(el.id)) return el;
+          const o = it.origMap[el.id];
+          if (!o) return el;
+          if ("x1" in o) {
+            const patch = { x1: o.x1 + dx, y1: o.y1 + dy, x2: o.x2 + dx, y2: o.y2 + dy };
+            if ("cx" in o) { patch.cx = o.cx + dx; patch.cy = o.cy + dy; }
+            return { ...el, ...patch };
+          }
+          return { ...el, x: o.x + dx, y: o.y + dy };
+        }));
       } else if (it.type === "resize") {
+        if (!it.historyPushed) { pushHistory(); it.historyPushed = true; }
         const box = resizeBox({ x: it.orig.x, y: it.orig.y, w: it.orig.w, h: it.orig.h }, it.handle, dx, dy);
         updateElement(it.orig.id, box);
       } else if (it.type === "endpoint") {
+        if (!it.historyPushed) { pushHistory(); it.historyPushed = true; }
         const o = it.orig;
         if (it.which === 1) updateElement(o.id, { x1: o.x1 + dx, y1: o.y1 + dy });
         else if (it.which === 2) updateElement(o.id, { x2: o.x2 + dx, y2: o.y2 + dy });
@@ -322,7 +535,20 @@ function BuildingDesigner() {
     }
     function onUp() {
       const it = interaction.current;
-      if (it && it.type === "draw" && draft) {
+      if (it && it.type === "marquee") {
+        const r = marqueeRef.current;
+        if (r) {
+          const rx1 = Math.min(r.x1, r.x2), rx2 = Math.max(r.x1, r.x2);
+          const ry1 = Math.min(r.y1, r.y2), ry2 = Math.max(r.y1, r.y2);
+          const hitIds = elementsRef.current.filter((el) => {
+            const b = elementBBox(el);
+            return !(b.maxX < rx1 || b.minX > rx2 || b.maxY < ry1 || b.minY > ry2);
+          }).map((el) => el.id);
+          setSelectedIds((prev) => (it.shift ? Array.from(new Set([...prev, ...hitIds])) : hitIds));
+        }
+        marqueeRef.current = null;
+        setMarquee(null);
+      } else if (it && it.type === "draw" && draft) {
         const x1 = snap(draft.x1, gridSize, snapOn), y1 = snap(draft.y1, gridSize, snapOn);
         let x2 = snap(draft.x2, gridSize, snapOn), y2 = snap(draft.y2, gridSize, snapOn);
         const hasDrag = dist(x1, y1, x2, y2) > MIN_SIZE;
@@ -343,8 +569,9 @@ function BuildingDesigner() {
           }
         }
         if (el) {
+          pushHistory();
           setElements((els) => [...els, el]);
-          setSelectedId(el.id);
+          setSelectedIds([el.id]);
         }
         setTool("select");
       }
@@ -381,21 +608,16 @@ function BuildingDesigner() {
 
   function fitToContent() {
     if (elements.length === 0) { setPxPerCm(PX_PER_CM_DEFAULT); setPan({ x: 80, y: 60 }); return; }
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    elements.forEach((el) => {
-      const xs = "x" in el ? [el.x, el.x + el.w] : ("cx" in el ? [el.x1, el.x2, el.cx] : [el.x1, el.x2]);
-      const ys = "y" in el ? [el.y, el.y + el.h] : ("cx" in el ? [el.y1, el.y2, el.cy] : [el.y1, el.y2]);
-      minX = Math.min(minX, ...xs); maxX = Math.max(maxX, ...xs);
-      minY = Math.min(minY, ...ys); maxY = Math.max(maxY, ...ys);
-    });
+    const b = unionBBox(elements);
     const rect = containerRef.current.getBoundingClientRect();
     const pad = 60;
-    const scale = Math.min((rect.width - pad * 2) / Math.max(1, maxX - minX), (rect.height - pad * 2) / Math.max(1, maxY - minY));
+    const scale = Math.min((rect.width - pad * 2) / Math.max(1, b.maxX - b.minX), (rect.height - pad * 2) / Math.max(1, b.maxY - b.minY));
     const next = Math.min(8, Math.max(0.15, scale));
     setPxPerCm(next);
-    setPan({ x: pad - minX * next, y: pad - minY * next });
+    setPan({ x: pad - b.minX * next, y: pad - b.minY * next });
   }
 
+  /* ----- save / load ----- */
   async function saveProject() {
     try {
       const slug = slugify(projectName);
@@ -408,7 +630,7 @@ function BuildingDesigner() {
       idx = idx.filter((p) => p.slug !== slug);
       idx.unshift({ slug, name: projectName, updatedAt: Date.now() });
       await window.storage.set("plan-index", JSON.stringify(idx), false);
-      setStatus("Saved ✓");
+      setStatus("Saved \u2713");
       setTimeout(() => setStatus(""), 1800);
     } catch (e) {
       setStatus("Couldn't save");
@@ -435,7 +657,9 @@ function BuildingDesigner() {
         setGridSize(data.gridSize || 50);
         setUnits(data.units || "cm");
         setProjectName(data.name || "Untitled Plan");
-        setSelectedId(null);
+        setSelectedIds([]);
+        historyRef.current = []; futureRef.current = [];
+        setHistoryLen(0); setFutureLen(0);
       }
     } catch (e) { setStatus("Couldn't load"); setTimeout(() => setStatus(""), 1800); }
     setOpenMenu(false);
@@ -443,27 +667,47 @@ function BuildingDesigner() {
 
   function newProject() {
     if (elements.length && !window.confirm("Start a new plan? Unsaved changes to the current canvas will be replaced (autosave keeps a copy).")) return;
-    setElements([]); setSelectedId(null); setProjectName("Untitled Plan");
+    setElements([]); setSelectedIds([]); setProjectName("Untitled Plan");
+    historyRef.current = []; futureRef.current = []; setHistoryLen(0); setFutureLen(0);
   }
 
-  const bbox = (() => {
-    if (elements.length === 0) return null;
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    elements.forEach((el) => {
-      const xs = "x" in el ? [el.x, el.x + el.w] : ("cx" in el ? [el.x1, el.x2, el.cx] : [el.x1, el.x2]);
-      const ys = "y" in el ? [el.y, el.y + el.h] : ("cx" in el ? [el.y1, el.y2, el.cy] : [el.y1, el.y2]);
-      minX = Math.min(minX, ...xs); maxX = Math.max(maxX, ...xs);
-      minY = Math.min(minY, ...ys); maxY = Math.max(maxY, ...ys);
-    });
-    return { w: maxX - minX, h: maxY - minY };
-  })();
+  async function exportAs(format) {
+    const svgString = buildExportSVG(elements, units, showMeasurements);
+    if (!svgString) { setStatus("Nothing to export yet"); setTimeout(() => setStatus(""), 1800); setExportMenuOpen(false); return; }
+    const base = slugify(projectName);
+    try {
+      if (format === "svg") {
+        downloadSVGString(svgString, `${base}.svg`);
+      } else {
+        const canvas = await svgToCanvas(svgString);
+        if (format === "png" || format === "jpg") {
+          const mime = format === "jpg" ? "image/jpeg" : "image/png";
+          downloadBlobUrl(canvas.toDataURL(mime, 0.95), `${base}.${format}`);
+        } else if (format === "pdf") {
+          const JsPDF = getJsPDF();
+          if (!JsPDF) { setStatus("PDF library unavailable"); setTimeout(() => setStatus(""), 1800); setExportMenuOpen(false); return; }
+          const orientation = canvas.width >= canvas.height ? "landscape" : "portrait";
+          const pdf = new JsPDF({ orientation, unit: "px", format: [canvas.width, canvas.height] });
+          pdf.addImage(canvas.toDataURL("image/png"), "PNG", 0, 0, canvas.width, canvas.height);
+          pdf.save(`${base}.pdf`);
+        }
+      }
+    } catch (e) {
+      setStatus("Export failed");
+      setTimeout(() => setStatus(""), 1800);
+    }
+    setExportMenuOpen(false);
+  }
+
+  /* ----- rendering helpers ----- */
+  const bbox = elements.length ? (() => { const b = unionBBox(elements); return { w: b.maxX - b.minX, h: b.maxY - b.minY }; })() : null;
 
   const TOOLS = [
     { id: "select", icon: MousePointer2, label: "Select (V)" },
     { id: "room", icon: Square, label: "Room (R)" },
     { id: "circle", icon: CircleIcon, label: "Circle (C)" },
     { id: "wall", icon: Minus, label: "Wall (W)" },
-    { id: "curve", icon: CurveIcon, label: "Curve (U)" },
+    { id: "curve", icon: Spline, label: "Curve (U)" },
     { id: "dimension", icon: Ruler, label: "Dimension (D)" },
     { id: "label", icon: Type, label: "Text (T)" },
   ];
@@ -473,13 +717,14 @@ function BuildingDesigner() {
 
   return (
     <div className="w-full h-full flex flex-col select-none" style={{ background: "#F6F2E7", fontFamily: "'IBM Plex Sans', ui-sans-serif, system-ui", minHeight: 600 }}>
-      <div className="flex items-center gap-3 px-3 py-2 border-b" style={{ background: "#20262E", borderColor: "#10141a" }}>
+      {/* top bar */}
+      <div className="flex items-center gap-2 px-3 py-2 border-b flex-wrap" style={{ background: "#20262E", borderColor: "#10141a" }}>
         <span className="text-sm tracking-wide" style={{ color: "#E9E3D3", fontWeight: 600 }}>Plan Draft</span>
         <input
           value={projectName}
           onChange={(e) => setProjectName(e.target.value)}
           className="text-sm px-2 py-1 rounded-none outline-none"
-          style={{ background: "#2B323C", color: "#E9E3D3", border: "1px solid #3a4250", width: 180 }}
+          style={{ background: "#2B323C", color: "#E9E3D3", border: "1px solid #3a4250", width: 160 }}
         />
         <button onClick={newProject} title="New plan" className="flex items-center gap-1 text-xs px-2 py-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}>
           <Plus size={13} /> New
@@ -502,6 +747,31 @@ function BuildingDesigner() {
             </div>
           )}
         </div>
+
+        <div style={{ width: 1, height: 22, background: "#3a4250" }} />
+        <button onClick={undo} disabled={historyLen === 0} title="Undo (Ctrl+Z)" className="p-1" style={{ color: historyLen ? "#E9E3D3" : "#4d5560", border: "1px solid #3a4250" }}><Undo2 size={14} /></button>
+        <button onClick={redo} disabled={futureLen === 0} title="Redo (Ctrl+Shift+Z)" className="p-1" style={{ color: futureLen ? "#E9E3D3" : "#4d5560", border: "1px solid #3a4250" }}><Redo2 size={14} /></button>
+
+        <div style={{ width: 1, height: 22, background: "#3a4250" }} />
+        <button onClick={() => setShowMeasurements((v) => !v)} title="Show/hide measurement numbers" className="flex items-center gap-1 text-xs px-2 py-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}>
+          {showMeasurements ? <Eye size={13} /> : <EyeOff size={13} />} Numbers
+        </button>
+
+        <div className="relative">
+          <button onClick={() => setExportMenuOpen((v) => !v)} title="Download" className="flex items-center gap-1 text-xs px-2 py-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}>
+            <Download size={13} /> Download
+          </button>
+          {exportMenuOpen && (
+            <div className="absolute left-0 top-8 z-20 w-32" style={{ background: "#2B323C", border: "1px solid #3a4250" }}>
+              {["png", "jpg", "pdf", "svg"].map((f) => (
+                <button key={f} onClick={() => exportAs(f)} className="w-full text-left text-xs px-3 py-2 hover:opacity-80 uppercase" style={{ color: "#E9E3D3", borderBottom: "1px solid #3a4250" }}>
+                  {f}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
         {status && <span className="text-xs" style={{ color: "#D98E2B" }}>{status}</span>}
 
         <div className="flex-1" />
@@ -521,9 +791,14 @@ function BuildingDesigner() {
         <button onClick={fitToContent} title="Fit to content" className="p-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}><Maximize2 size={14} /></button>
       </div>
 
+      {/* toolbar + canvas + panel */}
       <div className="flex flex-1 min-h-0">
-        <div className="flex flex-col gap-1 p-2" style={{ background: "#EDE7D8", borderRight: "1px solid #d9d0b8" }}>
-          {TOOLS.map((t) => {
+        {/* tool rail */}
+        <div className="flex flex-col gap-1 p-1 shrink-0" style={{ background: "#EDE7D8", borderRight: "1px solid #d9d0b8", width: leftOpen ? 52 : 22 }}>
+          <button onClick={() => setLeftOpen((v) => !v)} title={leftOpen ? "Collapse tools" : "Expand tools"} className="p-1 flex items-center justify-center" style={{ color: "#6b6350" }}>
+            {leftOpen ? <ChevronLeft size={13} /> : <ChevronRight size={13} />}
+          </button>
+          {leftOpen && TOOLS.map((t) => {
             const Icon = t.icon;
             const active = tool === t.id;
             return (
@@ -536,6 +811,7 @@ function BuildingDesigner() {
           })}
         </div>
 
+        {/* canvas */}
         <div
           ref={containerRef}
           onMouseDown={startBackground}
@@ -555,58 +831,86 @@ function BuildingDesigner() {
         >
           {elements.length === 0 && !draft && (
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-              <div className="text-sm text-center" style={{ color: "#9c927a", maxWidth: 260 }}>
-                Pick a tool on the left, then drag on the grid to draw. Everything snaps to {gridSize}cm — edit exact numbers on the right once selected.
+              <div className="text-sm text-center" style={{ color: "#9c927a", maxWidth: 280 }}>
+                Pick a tool on the left, then drag on the grid to draw. Everything snaps to {gridSize}cm. Shift+click or drag an empty area to select multiple shapes.
               </div>
             </div>
           )}
 
           <svg className="absolute inset-0 w-full h-full" style={{ pointerEvents: "none" }}>
-            <defs>
-              <marker id="tick1" markerWidth="10" markerHeight="10" refX="5" refY="5" orient="auto">
-                <line x1="5" y1="0" x2="5" y2="10" stroke="#2c5773" strokeWidth="1.4" />
-              </marker>
-            </defs>
             <g>
-              {elements.map((el) => renderShape(el, el.id === selectedId, toScreen, startElement, startHandle, startEndpoint, pxPerCm))}
+              {elements.map((el) => renderShape(el, selectedSet.has(el.id), selected && selected.id === el.id, toScreen, startElement, startHandle, startEndpoint, pxPerCm))}
               {draft && renderDraft(draft, toScreen)}
+              {marquee && (
+                <rect
+                  x={Math.min(toScreen(marquee.x1, 0).x, toScreen(marquee.x2, 0).x)}
+                  y={Math.min(toScreen(0, marquee.y1).y, toScreen(0, marquee.y2).y)}
+                  width={Math.abs(toScreen(marquee.x2, 0).x - toScreen(marquee.x1, 0).x)}
+                  height={Math.abs(toScreen(0, marquee.y2).y - toScreen(0, marquee.y1).y)}
+                  fill="#20262E15" stroke="#20262E" strokeDasharray="4 3"
+                />
+              )}
             </g>
           </svg>
 
-          {elements.map((el) => renderOverlay(el, units, toScreen))}
+          {/* overlay labels */}
+          {elements.map((el) => renderOverlay(el, units, toScreen, showMeasurements))}
           {draft && draft.type === "dimension" && (
             <OverlayText screen={mid(toScreen(draft.x1, draft.y1), toScreen(draft.x2, draft.y2))} text={fmt(dist(draft.x1, draft.y1, draft.x2, draft.y2), units)} accent />
           )}
 
           {cursorModel && (
             <div className="absolute bottom-2 left-2 text-xs px-2 py-1" style={{ background: "#20262Ecc", color: "#E9E3D3", fontFamily: "'IBM Plex Mono', ui-monospace, monospace" }}>
-              x {Math.round(cursorModel.x)} · y {Math.round(cursorModel.y)}
-              {bbox && <span style={{ marginLeft: 12, color: "#9aa1ab" }}>overall {Math.round(bbox.w)} × {Math.round(bbox.h)} cm</span>}
+              x {Math.round(cursorModel.x)} \u00b7 y {Math.round(cursorModel.y)}
+              {bbox && <span style={{ marginLeft: 12, color: "#9aa1ab" }}>overall {Math.round(bbox.w)} \u00d7 {Math.round(bbox.h)} cm</span>}
+              {selectedIds.length > 1 && <span style={{ marginLeft: 12, color: "#D98E2B" }}>{selectedIds.length} selected</span>}
             </div>
           )}
         </div>
 
-        <div className="w-64 shrink-0 flex flex-col" style={{ background: "#EDE7D8", borderLeft: "1px solid #d9d0b8" }}>
-          <div className="p-3 overflow-auto" style={{ flex: "0 0 auto" }}>
-            {!selected && <div className="text-xs" style={{ color: "#8b8267" }}>Nothing selected. Click a shape to edit its exact measurements.</div>}
-            {selected && <PropertyEditor el={selected} onChange={(patch) => updateElement(selected.id, patch)} onDuplicate={duplicateSelected} onDelete={() => { setElements((els) => els.filter((e) => e.id !== selected.id)); setSelectedId(null); }} />}
-          </div>
-          <div className="border-t px-3 py-2 text-xs" style={{ borderColor: "#d9d0b8", color: "#6b6350", fontWeight: 600 }}>Layers ({elements.length})</div>
-          <div className="flex-1 overflow-auto px-2 pb-2">
-            {elements.map((el) => (
-              <div key={el.id} onClick={() => setSelectedId(el.id)}
-                className="flex items-center justify-between px-2 py-1 mb-1 text-xs cursor-pointer"
-                style={{ background: el.id === selectedId ? "#D98E2B33" : "transparent", border: "1px solid " + (el.id === selectedId ? "#D98E2B" : "transparent"), color: "#3a3226" }}>
-                <span className="truncate">{el.label || el.text || el.type}</span>
-                <button onClick={(e) => { e.stopPropagation(); setElements((els) => els.filter((x) => x.id !== el.id)); if (selectedId === el.id) setSelectedId(null); }} className="ml-1 opacity-60 hover:opacity-100"><X size={12} /></button>
+        {/* property panel */}
+        <div className="shrink-0 flex flex-col" style={{ background: "#EDE7D8", borderLeft: "1px solid #d9d0b8", width: rightOpen ? 256 : 22 }}>
+          <button onClick={() => setRightOpen((v) => !v)} title={rightOpen ? "Collapse panel" : "Expand panel"} className="p-1 flex items-center justify-center self-start" style={{ color: "#6b6350" }}>
+            {rightOpen ? <ChevronRight size={13} /> : <ChevronLeft size={13} />}
+          </button>
+          {rightOpen && (
+            <>
+              <div className="p-3 overflow-auto" style={{ flex: "0 0 auto" }}>
+                {selectedIds.length === 0 && <div className="text-xs" style={{ color: "#8b8267" }}>Nothing selected. Click a shape to edit its exact measurements, or shift-click / drag to select several.</div>}
+                {selectedIds.length === 1 && selected && (
+                  <PropertyEditor el={selected} onChange={(patch) => updateElement(selected.id, patch)} onDuplicate={duplicateSelected}
+                    onDelete={() => { pushHistory(); setElements((els) => els.filter((e) => e.id !== selected.id)); setSelectedIds([]); }} />
+                )}
+                {selectedIds.length > 1 && (
+                  <MultiPropertyEditor
+                    count={selectedIds.length}
+                    onDuplicate={duplicateSelected}
+                    onDelete={() => { pushHistory(); setElements((els) => els.filter((e) => !selectedIds.includes(e.id))); setSelectedIds([]); }}
+                    onColor={(idx) => { pushHistory(); setElements((els) => els.map((e) => (selectedIds.includes(e.id) && "colorIdx" in e ? { ...e, colorIdx: idx } : e))); }}
+                  />
+                )}
               </div>
-            ))}
-          </div>
+              <div className="border-t px-3 py-2 text-xs" style={{ borderColor: "#d9d0b8", color: "#6b6350", fontWeight: 600 }}>Layers ({elements.length})</div>
+              <div className="flex-1 overflow-auto px-2 pb-2">
+                {elements.map((el) => (
+                  <div key={el.id}
+                    onClick={(e) => setSelectedIds((ids) => e.shiftKey ? (ids.includes(el.id) ? ids.filter((id) => id !== el.id) : [...ids, el.id]) : [el.id])}
+                    className="flex items-center justify-between px-2 py-1 mb-1 text-xs cursor-pointer"
+                    style={{ background: selectedSet.has(el.id) ? "#D98E2B33" : "transparent", border: "1px solid " + (selectedSet.has(el.id) ? "#D98E2B" : "transparent"), color: "#3a3226" }}>
+                    <span className="truncate">{el.label || el.text || el.type}</span>
+                    <button onClick={(e) => { e.stopPropagation(); pushHistory(); setElements((els) => els.filter((x) => x.id !== el.id)); setSelectedIds((ids) => ids.filter((id) => id !== el.id)); }} className="ml-1 opacity-60 hover:opacity-100"><X size={12} /></button>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
         </div>
       </div>
     </div>
   );
 }
+
+/* ---------- sub components / render helpers ---------- */
 
 function mid(a, b) { return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; }
 
@@ -632,7 +936,7 @@ function renderDraft(draft, toScreen) {
   return <line x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y} stroke="#D98E2B" strokeWidth={2} strokeDasharray="4 3" />;
 }
 
-function renderShape(el, isSelected, toScreen, onDown, onHandle, onEndpoint, pxPerCm) {
+function renderShape(el, isSelected, isPrimary, toScreen, onDown, onHandle, onEndpoint, pxPerCm) {
   const stroke = isSelected ? "#D98E2B" : undefined;
   if (el.type === "room" || el.type === "circle") {
     const c = COLORS[el.colorIdx] || COLORS[1];
@@ -648,7 +952,7 @@ function renderShape(el, isSelected, toScreen, onDown, onHandle, onEndpoint, pxP
         {el.type === "room"
           ? <rect x={a.x} y={a.y} width={w} height={h} {...commonProps} />
           : <ellipse cx={a.x + w / 2} cy={a.y + h / 2} rx={w / 2} ry={h / 2} {...commonProps} />}
-        {isSelected && HANDLES.map((h2) => {
+        {isPrimary && HANDLES.map((h2) => {
           const hx = a.x + h2.cx * w, hy = a.y + h2.cy * h;
           return (
             <rect key={h2.id} x={hx - 4} y={hy - 4} width={8} height={8} fill="#FBF8F0" stroke="#20262E" strokeWidth={1}
@@ -659,12 +963,13 @@ function renderShape(el, isSelected, toScreen, onDown, onHandle, onEndpoint, pxP
     );
   }
   if (el.type === "wall") {
+    const c = COLORS[el.colorIdx ?? 0] || COLORS[0];
     const p1 = toScreen(el.x1, el.y1), p2 = toScreen(el.x2, el.y2);
     return (
       <g key={el.id}>
-        <line x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y} stroke={stroke || "#2b2620"} strokeWidth={Math.max(2, el.thickness * pxPerCm)} strokeLinecap="square"
+        <line x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y} stroke={stroke || c.stroke} strokeWidth={Math.max(2, el.thickness * pxPerCm)} strokeLinecap="square"
           style={{ pointerEvents: "auto", cursor: "move" }} onMouseDown={(e) => onDown(e, el)} />
-        {isSelected && [{ p: p1, n: 1 }, { p: p2, n: 2 }].map(({ p, n }) => (
+        {isPrimary && [{ p: p1, n: 1 }, { p: p2, n: 2 }].map(({ p, n }) => (
           <circle key={n} cx={p.x} cy={p.y} r={5} fill="#FBF8F0" stroke="#20262E" strokeWidth={1.5}
             style={{ cursor: "pointer", pointerEvents: "auto" }} onMouseDown={(e) => onEndpoint(e, el, n)} />
         ))}
@@ -672,13 +977,14 @@ function renderShape(el, isSelected, toScreen, onDown, onHandle, onEndpoint, pxP
     );
   }
   if (el.type === "curve") {
+    const c = COLORS[el.colorIdx ?? 0] || COLORS[0];
     const p1 = toScreen(el.x1, el.y1), p2 = toScreen(el.x2, el.y2), cp = toScreen(el.cx, el.cy);
     const d = `M ${p1.x} ${p1.y} Q ${cp.x} ${cp.y} ${p2.x} ${p2.y}`;
     return (
       <g key={el.id}>
-        <path d={d} fill="none" stroke={stroke || "#2b2620"} strokeWidth={Math.max(2, el.thickness * pxPerCm)} strokeLinecap="round"
+        <path d={d} fill="none" stroke={stroke || c.stroke} strokeWidth={Math.max(2, el.thickness * pxPerCm)} strokeLinecap="round"
           style={{ pointerEvents: "auto", cursor: "move" }} onMouseDown={(e) => onDown(e, el)} />
-        {isSelected && (
+        {isPrimary && (
           <>
             <line x1={p1.x} y1={p1.y} x2={cp.x} y2={cp.y} stroke="#D98E2B" strokeWidth={1} strokeDasharray="3 3" vectorEffect="non-scaling-stroke" style={{ pointerEvents: "none" }} />
             <line x1={p2.x} y1={p2.y} x2={cp.x} y2={cp.y} stroke="#D98E2B" strokeWidth={1} strokeDasharray="3 3" vectorEffect="non-scaling-stroke" style={{ pointerEvents: "none" }} />
@@ -703,7 +1009,7 @@ function renderShape(el, isSelected, toScreen, onDown, onHandle, onEndpoint, pxP
         <line x1={p2.x - nx} y1={p2.y - ny} x2={p2.x + nx} y2={p2.y + ny} stroke={stroke || "#2c5773"} strokeWidth={1.4} vectorEffect="non-scaling-stroke" />
         <line x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y} stroke={stroke || "#2c5773"} strokeWidth={1.4} vectorEffect="non-scaling-stroke"
           style={{ pointerEvents: "auto", cursor: "move" }} onMouseDown={(e) => onDown(e, el)} />
-        {isSelected && [{ p: p1, n: 1 }, { p: p2, n: 2 }].map(({ p, n }) => (
+        {isPrimary && [{ p: p1, n: 1 }, { p: p2, n: 2 }].map(({ p, n }) => (
           <circle key={n} cx={p.x} cy={p.y} r={5} fill="#FBF8F0" stroke="#20262E" strokeWidth={1.5}
             style={{ cursor: "pointer", pointerEvents: "auto" }} onMouseDown={(e) => onEndpoint(e, el, n)} />
         ))}
@@ -713,36 +1019,37 @@ function renderShape(el, isSelected, toScreen, onDown, onHandle, onEndpoint, pxP
   return null;
 }
 
-function renderOverlay(el, units, toScreen) {
+function renderOverlay(el, units, toScreen, showMeasurements) {
   if (el.type === "room" || el.type === "circle") {
     const c1 = toScreen(el.x, el.y), c2 = toScreen(el.x + el.w, el.y + el.h);
     const center = mid(c1, c2);
-    return <OverlayText key={el.id} screen={center} text={el.label || (el.type === "room" ? "Room" : "")} sub={`${fmt(el.w, units)} × ${fmt(el.h, units)}`} />;
+    const main = el.label || (el.type === "room" ? "Room" : "");
+    const sub = showMeasurements ? `${fmt(el.w, units)} \u00d7 ${fmt(el.h, units)}` : null;
+    if (!main && !sub) return null;
+    return <OverlayText key={el.id} screen={center} text={main || sub} sub={main ? sub : null} />;
   }
   if (el.type === "wall") {
     const p1 = toScreen(el.x1, el.y1), p2 = toScreen(el.x2, el.y2);
-    return <OverlayText key={el.id} screen={mid(p1, p2)} text={fmt(dist(el.x1, el.y1, el.x2, el.y2), units)} />;
+    const main = el.label || "";
+    const sub = showMeasurements ? fmt(dist(el.x1, el.y1, el.x2, el.y2), units) : null;
+    if (!main && !sub) return null;
+    return <OverlayText key={el.id} screen={mid(p1, p2)} text={main || sub} sub={main ? sub : null} />;
   }
   if (el.type === "curve") {
     const bx = 0.25 * el.x1 + 0.5 * el.cx + 0.25 * el.x2;
     const by = 0.25 * el.y1 + 0.5 * el.cy + 0.25 * el.y2;
-    let len = 0, prev = { x: el.x1, y: el.y1 };
-    for (let i = 1; i <= 10; i++) {
-      const t = i / 10;
-      const x = (1 - t) * (1 - t) * el.x1 + 2 * (1 - t) * t * el.cx + t * t * el.x2;
-      const y = (1 - t) * (1 - t) * el.y1 + 2 * (1 - t) * t * el.cy + t * t * el.y2;
-      len += dist(prev.x, prev.y, x, y);
-      prev = { x, y };
-    }
-    return <OverlayText key={el.id} screen={toScreen(bx, by)} text={fmt(len, units)} />;
+    const main = el.label || "";
+    const sub = showMeasurements ? fmt(curveLength(el), units) : null;
+    if (!main && !sub) return null;
+    return <OverlayText key={el.id} screen={toScreen(bx, by)} text={main || sub} sub={main ? sub : null} />;
   }
   if (el.type === "dimension") {
-    const p1 = toScreen(el.x1, el.y1), p2 = toScreen(el.x2, el.y2);
-    return <OverlayText key={el.id} screen={mid(p1, p2)} text={el.customLabel || fmt(dist(el.x1, el.y1, el.x2, el.y2), units)} accent />;
+    if (el.customLabel) return <OverlayText key={el.id} screen={mid(toScreen(el.x1, el.y1), toScreen(el.x2, el.y2))} text={el.customLabel} accent />;
+    if (!showMeasurements) return null;
+    return <OverlayText key={el.id} screen={mid(toScreen(el.x1, el.y1), toScreen(el.x2, el.y2))} text={fmt(dist(el.x1, el.y1, el.x2, el.y2), units)} accent />;
   }
   if (el.type === "label") {
-    const p = toScreen(el.x, el.y);
-    return <OverlayText key={el.id} screen={p} text={el.text} />;
+    return <OverlayText key={el.id} screen={toScreen(el.x, el.y)} text={el.text} />;
   }
   return null;
 }
@@ -757,9 +1064,35 @@ function NumField({ label, value, onChange }) {
   );
 }
 
+function ColorSwatches({ colorIdx, onPick }) {
+  return (
+    <div className="flex gap-1 mt-2 mb-1 flex-wrap">
+      {COLORS.map((c, i) => (
+        <button key={c.name} title={c.name} onClick={() => onPick(i)}
+          style={{ width: 20, height: 20, background: c.fill === "none" ? "#fff" : c.fill, border: "2px solid " + (colorIdx === i ? "#D98E2B" : c.stroke) }} />
+      ))}
+    </div>
+  );
+}
+
+function MultiPropertyEditor({ count, onDuplicate, onDelete, onColor }) {
+  return (
+    <div>
+      <div className="text-xs mb-2" style={{ color: "#4a4330", fontWeight: 600 }}>{count} shapes selected</div>
+      <div className="text-xs mb-1" style={{ color: "#8b8267" }}>Apply color to all (where it applies)</div>
+      <ColorSwatches colorIdx={-1} onPick={onColor} />
+      <div className="flex gap-2 mt-3">
+        <button onClick={onDuplicate} className="flex-1 flex items-center justify-center gap-1 text-xs py-1.5" style={{ border: "1px solid #d9d0b8", color: "#3a3226" }}><Copy size={12} /> Duplicate all</button>
+        <button onClick={onDelete} className="flex-1 flex items-center justify-center gap-1 text-xs py-1.5" style={{ border: "1px solid #b8564a", color: "#b8564a" }}><Trash2 size={12} /> Delete all</button>
+      </div>
+    </div>
+  );
+}
+
 function PropertyEditor({ el, onChange, onDuplicate, onDelete }) {
   const isBox = el.type === "room" || el.type === "circle";
   const isLine = el.type === "wall" || el.type === "dimension" || el.type === "curve";
+  const isStructure = el.type === "wall" || el.type === "curve";
   return (
     <div>
       <div className="text-xs mb-2 uppercase tracking-wide" style={{ color: "#8b8267", letterSpacing: 1 }}>{el.type}</div>
@@ -774,13 +1107,15 @@ function PropertyEditor({ el, onChange, onDuplicate, onDelete }) {
           <NumField label="Y" value={el.y} onChange={(v) => onChange({ y: v })} />
           <NumField label="Width" value={el.w} onChange={(v) => onChange({ w: Math.max(10, v) })} />
           <NumField label="Height" value={el.h} onChange={(v) => onChange({ h: Math.max(10, v) })} />
-          <div className="flex gap-1 mt-2 mb-1 flex-wrap">
-            {COLORS.map((c, i) => (
-              <button key={c.name} title={c.name} onClick={() => onChange({ colorIdx: i })}
-                style={{ width: 20, height: 20, background: c.fill === "none" ? "#fff" : c.fill, border: "2px solid " + (el.colorIdx === i ? "#D98E2B" : c.stroke) }} />
-            ))}
-          </div>
+          <ColorSwatches colorIdx={el.colorIdx} onPick={(i) => onChange({ colorIdx: i })} />
         </>
+      )}
+
+      {isStructure && (
+        <label className="block text-xs mb-2" style={{ color: "#4a4330" }}>
+          Name
+          <input value={el.label} placeholder="optional" onChange={(e) => onChange({ label: e.target.value })} className="w-full mt-1 text-xs px-1.5 py-1" style={{ background: "#FBF8F0", border: "1px solid #d9d0b8" }} />
+        </label>
       )}
 
       {isLine && (
@@ -789,13 +1124,14 @@ function PropertyEditor({ el, onChange, onDuplicate, onDelete }) {
           <NumField label="Y1" value={el.y1} onChange={(v) => onChange({ y1: v })} />
           <NumField label="X2" value={el.x2} onChange={(v) => onChange({ x2: v })} />
           <NumField label="Y2" value={el.y2} onChange={(v) => onChange({ y2: v })} />
-          {(el.type === "wall" || el.type === "curve") && <NumField label="Thick." value={el.thickness} onChange={(v) => onChange({ thickness: Math.max(2, v) })} />}
+          {isStructure && <NumField label="Thick." value={el.thickness} onChange={(v) => onChange({ thickness: Math.max(2, v) })} />}
           {el.type === "curve" && (
             <>
               <NumField label="Curve X" value={el.cx} onChange={(v) => onChange({ cx: v })} />
               <NumField label="Curve Y" value={el.cy} onChange={(v) => onChange({ cy: v })} />
             </>
           )}
+          {isStructure && <ColorSwatches colorIdx={el.colorIdx} onPick={(i) => onChange({ colorIdx: i })} />}
           {el.type === "dimension" && (
             <label className="block text-xs mt-1" style={{ color: "#4a4330" }}>
               Custom label
@@ -828,7 +1164,8 @@ function PropertyEditor({ el, onChange, onDuplicate, onDelete }) {
 }
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
-root.render(<BuildingDesigner />);
+root.render(React.createElement(BuildingDesigner));
+
 </script>
 <script>
   (function () {
