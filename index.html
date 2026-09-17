@@ -432,15 +432,14 @@ function BuildingDesigner() {
     if (e.button !== 0 && e.button !== 1) return;
     const m = toModel(e.clientX, e.clientY);
     if (tool === "select") {
-      if (e.button === 1 || e.altKey) {
-        e.preventDefault();
+      if (e.shiftKey) {
+        interaction.current = { type: "marquee", startModel: m, shift: true };
+        marqueeRef.current = { x1: m.x, y1: m.y, x2: m.x, y2: m.y };
+        setMarquee(marqueeRef.current);
+      } else {
+        setSelectedIds([]);
         interaction.current = { type: "pan", startClientX: e.clientX, startClientY: e.clientY, startPan: pan };
-        return;
       }
-      if (!e.shiftKey) setSelectedIds([]);
-      interaction.current = { type: "marquee", startModel: m, shift: e.shiftKey };
-      marqueeRef.current = { x1: m.x, y1: m.y, x2: m.x, y2: m.y };
-      setMarquee(marqueeRef.current);
     } else if (tool === "label") {
       const el = defaultElement("label", snap(m.x, gridSize, snapOn), snap(m.y, gridSize, snapOn));
       pushHistory();
@@ -832,7 +831,7 @@ function BuildingDesigner() {
           {elements.length === 0 && !draft && (
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
               <div className="text-sm text-center" style={{ color: "#9c927a", maxWidth: 280 }}>
-                Pick a tool on the left, then drag on the grid to draw. Everything snaps to {gridSize}cm. Shift+click or drag an empty area to select multiple shapes.
+                Pick a tool on the left, then drag on the grid to draw. Everything snaps to {gridSize}cm. Drag empty space to pan; shift+click or shift+drag to select multiple shapes.
               </div>
             </div>
           )}
