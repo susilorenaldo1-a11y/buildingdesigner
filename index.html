@@ -75,6 +75,8 @@ const EyeOff = glyphIcon("\uD83D\uDEAB");
 const Download = glyphIcon("\u2913");
 const ChevronLeft = glyphIcon("\u2039");
 const ChevronRight = glyphIcon("\u203A");
+const FileDown = glyphIcon("\u2B07");
+const FileUp = glyphIcon("\u2B06");
 
 
 /* ---------- constants & helpers ---------- */
@@ -307,6 +309,7 @@ function BuildingDesigner() {
   const elementsRef = useRef([]);
   const historyRef = useRef([]);
   const futureRef = useRef([]);
+  const fileInputRef = useRef(null);
 
   useEffect(() => { elementsRef.current = elements; }, [elements]);
 
@@ -672,30 +675,100 @@ function BuildingDesigner() {
 
   async function exportAs(format) {
     const svgString = buildExportSVG(elements, units, showMeasurements);
-    if (!svgString) { setStatus("Nothing to export yet"); setTimeout(() => setStatus(""), 1800); setExportMenuOpen(false); return; }
+    if (!svgString) {
+      setStatus("Nothing to export yet");
+      setTimeout(() => setStatus(""), 1800);
+      setExportMenuOpen(false);
+      return;
+    }
     const base = slugify(projectName);
+    const done = (msg, ms) => { setStatus(msg); setTimeout(() => setStatus(""), ms || 1800); setExportMenuOpen(false); };
     try {
       if (format === "svg") {
         downloadSVGString(svgString, `${base}.svg`);
-      } else {
-        const canvas = await svgToCanvas(svgString);
-        if (format === "png" || format === "jpg") {
-          const mime = format === "jpg" ? "image/jpeg" : "image/png";
-          downloadBlobUrl(canvas.toDataURL(mime, 0.95), `${base}.${format}`);
-        } else if (format === "pdf") {
-          const JsPDF = getJsPDF();
-          if (!JsPDF) { setStatus("PDF library unavailable"); setTimeout(() => setStatus(""), 1800); setExportMenuOpen(false); return; }
-          const orientation = canvas.width >= canvas.height ? "landscape" : "portrait";
-          const pdf = new JsPDF({ orientation, unit: "px", format: [canvas.width, canvas.height] });
-          pdf.addImage(canvas.toDataURL("image/png"), "PNG", 0, 0, canvas.width, canvas.height);
-          pdf.save(`${base}.pdf`);
+        done("Downloaded \u2713");
+        return;
+      }
+      let canvas;
+      try {
+        canvas = await svgToCanvas(svgString);
+      } catch (err) {
+        console.error("SVG rasterize failed", err);
+        done("Couldn't render image \u2014 try SVG instead", 2600);
+        return;
+      }
+      if (format === "png" || format === "jpg") {
+        const mime = format === "jpg" ? "image/jpeg" : "image/png";
+        let blob;
+        try {
+          blob = await new Promise((resolve, reject) => canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("toBlob returned null"))), mime, 0.95));
+        } catch (err) {
+          console.error("Canvas export blocked", err);
+          done("Browser blocked image export \u2014 try SVG instead", 2600);
+          return;
         }
+        const url = URL.createObjectURL(blob);
+        downloadBlobUrl(url, `${base}.${format}`);
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+        done("Downloaded \u2713");
+        return;
+      }
+      if (format === "pdf") {
+        const JsPDF = getJsPDF();
+        if (!JsPDF) {
+          done("PDF library still loading \u2014 try again in a moment", 2600);
+          return;
+        }
+        const orientation = canvas.width >= canvas.height ? "landscape" : "portrait";
+        const pdf = new JsPDF({ orientation, unit: "px", format: [canvas.width, canvas.height] });
+        pdf.addImage(canvas.toDataURL("image/png"), "PNG", 0, 0, canvas.width, canvas.height);
+        const pdfBlob = pdf.output("blob");
+        const url = URL.createObjectURL(pdfBlob);
+        downloadBlobUrl(url, `${base}.pdf`);
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+        done("Downloaded \u2713");
+        return;
       }
     } catch (e) {
-      setStatus("Export failed");
-      setTimeout(() => setStatus(""), 1800);
+      console.error("Export failed", e);
+      done("Export failed");
     }
-    setExportMenuOpen(false);
+  }
+
+  /* ----- cross-device project transfer (file-based, not tied to this browser) ----- */
+  function exportProjectFile() {
+    const data = { name: projectName, elements, gridSize, units, exportedAt: Date.now() };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    downloadBlobUrl(url, `${slugify(projectName)}.json`);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    setStatus("Project file downloaded \u2713");
+    setTimeout(() => setStatus(""), 1800);
+  }
+
+  function importProjectFile(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        setElements(data.elements || []);
+        setGridSize(data.gridSize || 50);
+        setUnits(data.units || "cm");
+        setProjectName(data.name || "Imported Plan");
+        setSelectedIds([]);
+        historyRef.current = []; futureRef.current = [];
+        setHistoryLen(0); setFutureLen(0);
+        setStatus("Project loaded \u2713");
+        setTimeout(() => setStatus(""), 1800);
+      } catch (err) {
+        setStatus("Couldn't read that file");
+        setTimeout(() => setStatus(""), 1800);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
   }
 
   /* ----- rendering helpers ----- */
@@ -728,11 +801,11 @@ function BuildingDesigner() {
         <button onClick={newProject} title="New plan" className="flex items-center gap-1 text-xs px-2 py-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}>
           <Plus size={13} /> New
         </button>
-        <button onClick={saveProject} title="Save" className="flex items-center gap-1 text-xs px-2 py-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}>
+        <button onClick={saveProject} title="Save to this browser (stays on this device)" className="flex items-center gap-1 text-xs px-2 py-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}>
           <Save size={13} /> Save
         </button>
         <div className="relative">
-          <button onClick={openMenuToggle} title="Open a saved plan" className="flex items-center gap-1 text-xs px-2 py-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}>
+          <button onClick={openMenuToggle} title="Open a plan saved in this browser" className="flex items-center gap-1 text-xs px-2 py-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}>
             <FolderOpen size={13} /> Open
           </button>
           {openMenu && (
@@ -746,6 +819,16 @@ function BuildingDesigner() {
             </div>
           )}
         </div>
+
+        <div style={{ width: 1, height: 22, background: "#3a4250" }} />
+        <button onClick={exportProjectFile} title="Download this plan as a file, to open on another device" className="flex items-center gap-1 text-xs px-2 py-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}>
+          <FileDown size={13} /> Export
+        </button>
+        <button onClick={() => fileInputRef.current && fileInputRef.current.click()} title="Load a plan file exported from another device" className="flex items-center gap-1 text-xs px-2 py-1" style={{ color: "#E9E3D3", border: "1px solid #3a4250" }}>
+          <FileUp size={13} /> Import
+        </button>
+        <input ref={fileInputRef} type="file" accept="application/json,.json" onChange={importProjectFile} style={{ display: "none" }} />
+
 
         <div style={{ width: 1, height: 22, background: "#3a4250" }} />
         <button onClick={undo} disabled={historyLen === 0} title="Undo (Ctrl+Z)" className="p-1" style={{ color: historyLen ? "#E9E3D3" : "#4d5560", border: "1px solid #3a4250" }}><Undo2 size={14} /></button>
